@@ -1,0 +1,6 @@
+{
+  "name": "Expense Tracker",
+  "description": "A premium offline-first expense tracker dashboard featuring dynamic spending charts, partner income sharing ratio calculator, savings goals with reminders, AI receipt scanner, and biometric protection.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
