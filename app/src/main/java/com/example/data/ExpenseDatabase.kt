@@ -46,7 +46,13 @@ data class FamilyConfigEntity(
     val currentUserName: String = "",
     val partnerName: String = "",
     val userSignedIn: Boolean = false,
-    val biometricsPassed: Boolean = false
+    val biometricsPassed: Boolean = false,
+    val passkeyRegistered: Boolean = false,
+    val fingerAuthRegistered: Boolean = false,
+    val storedPasscode: String = "",
+    val dailyAlertEnabled: Boolean = false,
+    val dailyAlertTime: String = "20:00",
+    val darkModeEnabled: Boolean = true
 )
 
 @Entity(tableName = "category_budgets")
@@ -157,6 +163,24 @@ interface ExpenseDao {
 
     @Delete
     suspend fun deleteRecurringTransaction(recurring: RecurringTransactionEntity)
+
+    @Query("DELETE FROM transactions")
+    suspend fun deleteAllTransactions()
+
+    @Query("DELETE FROM goals")
+    suspend fun deleteAllGoals()
+
+    @Query("DELETE FROM category_budgets")
+    suspend fun deleteAllCategoryBudgets()
+
+    @Query("DELETE FROM credit_cards")
+    suspend fun deleteAllCreditCards()
+
+    @Query("DELETE FROM bank_lendings")
+    suspend fun deleteAllBankLendings()
+
+    @Query("DELETE FROM recurring_transactions")
+    suspend fun deleteAllRecurringTransactions()
 }
 
 @Database(entities = [
@@ -167,7 +191,7 @@ interface ExpenseDao {
     CreditCardEntity::class, 
     BankLendingEntity::class, 
     RecurringTransactionEntity::class
-], version = 4, exportSchema = false)
+], version = 6, exportSchema = false)
 abstract class ExpenseDatabase : RoomDatabase() {
     abstract fun expenseDao(): ExpenseDao
 }

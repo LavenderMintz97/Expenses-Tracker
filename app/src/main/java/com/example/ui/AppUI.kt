@@ -26,6 +26,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -40,17 +41,29 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.platform.LocalDensity
+import kotlin.math.roundToInt
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -103,6 +116,7 @@ import com.example.ui.theme.SophisticatedTextMain
 import com.example.ui.theme.SophisticatedTextMuted
 
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 
 data class EditableTransactionState(
@@ -114,6 +128,13 @@ data class EditableTransactionState(
     val isSelected: Boolean = true
 )
 
+data class EditableReceiptItem(
+    val name: MutableState<String>,
+    val price: MutableState<String>,
+    val category: MutableState<String>,
+    val isSelected: MutableState<Boolean> = mutableStateOf(true)
+)
+
 @Composable
 fun AppContent(viewModel: MainViewModel) {
     val userSignedIn by viewModel.userSignedIn.collectAsState()
@@ -121,7 +142,15 @@ fun AppContent(viewModel: MainViewModel) {
     val showBiometricPrompt by viewModel.showBiometricPrompt.collectAsState()
     val darkModeEnabled by viewModel.darkModeEnabled.collectAsState()
     val activeNotification by viewModel.activeNotification.collectAsState()
-
+    val canUndo by viewModel.canUndo.collectAsState()
+ 
+    val context = androidx.compose.ui.platform.LocalContext.current
+    androidx.compose.runtime.LaunchedEffect(activeNotification) {
+        activeNotification?.let { msg ->
+            android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT).show()
+        }
+    }
+ 
     MyApplicationTheme(
         darkTheme = darkModeEnabled
     ) {
@@ -140,7 +169,7 @@ fun AppContent(viewModel: MainViewModel) {
                     // Core App Dashboard Frame
                     MainAppFrame(viewModel = viewModel)
                 }
-
+ 
                 // Push Notification Banner Overlay
                 AnimatedVisibility(
                     visible = activeNotification != null,
@@ -154,7 +183,8 @@ fun AppContent(viewModel: MainViewModel) {
                     activeNotification?.let { msg ->
                         NotificationBanner(
                             message = msg,
-                            onDismiss = { viewModel.clearNotification() }
+                            onDismiss = { viewModel.clearNotification() },
+                            onUndo = if (canUndo) { { viewModel.triggerUndo() } } else null
                         )
                     }
                 }
@@ -162,9 +192,9 @@ fun AppContent(viewModel: MainViewModel) {
         }
     }
 }
-
+ 
 @Composable
-fun NotificationBanner(message: String, onDismiss: () -> Unit) {
+fun NotificationBanner(message: String, onDismiss: () -> Unit, onUndo: (() -> Unit)? = null) {
     Card(
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(
@@ -210,6 +240,15 @@ fun NotificationBanner(message: String, onDismiss: () -> Unit) {
                     color = Color.White
                 )
             }
+            if (onUndo != null) {
+                TextButton(
+                    onClick = onUndo,
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                    modifier = Modifier.height(30.dp).testTag("notification_undo_button")
+                ) {
+                    Text("UNDO", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MintEmerald)
+                }
+            }
             IconButton(onClick = onDismiss, modifier = Modifier.size(24.dp)) {
                 Icon(
                     imageVector = Icons.Default.Close,
@@ -224,8 +263,11 @@ fun NotificationBanner(message: String, onDismiss: () -> Unit) {
 
 @Composable
 fun LoginScreen(viewModel: MainViewModel) {
-    var nameInput by remember { mutableStateFlowOf("") }
-    var passwordInput by remember { mutableStateFlowOf("") }
+    val darkModeEnabled by viewModel.darkModeEnabled.collectAsState()
+    var nameInput by remember { mutableStateOf("") }
+    var passwordInput by remember { mutableStateOf("") }
+    var loginError by remember { mutableStateOf<String?>(null) }
+    var loginSuccessMessage by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
     Column(
@@ -291,37 +333,107 @@ fun LoginScreen(viewModel: MainViewModel) {
 
                 OutlinedTextField(
                     value = nameInput,
-                    onValueChange = { nameInput = it },
+                    onValueChange = { 
+                        nameInput = it
+                        loginError = null
+                        loginSuccessMessage = null
+                    },
                     label = { Text("Account Owner Name") },
                     placeholder = { Text("e.g. Ananya") },
-                    leadingIcon = { Icon(Icons.Default.Person, "Person") },
+                    leadingIcon = { Icon(Icons.Default.Person, "Person", tint = if (darkModeEnabled) Color.White.copy(alpha = 0.7f) else Color.DarkGray) },
                     singleLine = true,
+                    textStyle = LocalTextStyle.current.copy(
+                        textAlign = TextAlign.Start,
+                        color = if (darkModeEnabled) Color.White else Color.Black
+                    ),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Text,
+                        imeAction = ImeAction.Next
+                    ),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = NeonIndigo,
-                        unfocusedBorderColor = Color.Gray.copy(alpha = 0.4f)
+                        unfocusedBorderColor = if (darkModeEnabled) Color.White.copy(alpha = 0.3f) else Color.Gray.copy(alpha = 0.5f),
+                        focusedLabelColor = NeonIndigo,
+                        unfocusedLabelColor = if (darkModeEnabled) Color.White.copy(alpha = 0.6f) else Color.Gray,
+                        focusedTextColor = if (darkModeEnabled) Color.White else Color.Black,
+                        unfocusedTextColor = if (darkModeEnabled) Color.White else Color.Black,
+                        focusedContainerColor = if (darkModeEnabled) Color.White.copy(alpha = 0.05f) else Color.Transparent,
+                        unfocusedContainerColor = if (darkModeEnabled) Color.White.copy(alpha = 0.02f) else Color.Transparent
                     ),
                     modifier = Modifier.fillMaxWidth().testTag("username_input")
                 )
 
                 OutlinedTextField(
                     value = passwordInput,
-                    onValueChange = { passwordInput = it },
-                    label = { Text("Account Security PIN") },
-                    placeholder = { Text("Enter any passcode") },
-                    leadingIcon = { Icon(Icons.Default.Lock, "Lock") },
+                    onValueChange = { 
+                        if (it.length <= 4 && it.all { char -> char.isDigit() }) {
+                            passwordInput = it
+                            loginError = null
+                            loginSuccessMessage = null
+                        }
+                    },
+                    label = { Text("Account Security PIN (4-Digit)") },
+                    placeholder = { Text("Enter 4-digit PIN") },
+                    leadingIcon = { Icon(Icons.Default.Lock, "Lock", tint = if (darkModeEnabled) Color.White.copy(alpha = 0.7f) else Color.DarkGray) },
                     visualTransformation = PasswordVisualTransformation(),
                     singleLine = true,
+                    textStyle = LocalTextStyle.current.copy(
+                        textAlign = TextAlign.Start,
+                        color = if (darkModeEnabled) Color.White else Color.Black
+                    ),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Number,
+                        imeAction = ImeAction.Done
+                    ),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = NeonIndigo,
-                        unfocusedBorderColor = Color.Gray.copy(alpha = 0.4f)
+                        unfocusedBorderColor = if (darkModeEnabled) Color.White.copy(alpha = 0.3f) else Color.Gray.copy(alpha = 0.5f),
+                        focusedLabelColor = NeonIndigo,
+                        unfocusedLabelColor = if (darkModeEnabled) Color.White.copy(alpha = 0.6f) else Color.Gray,
+                        focusedTextColor = if (darkModeEnabled) Color.White else Color.Black,
+                        unfocusedTextColor = if (darkModeEnabled) Color.White else Color.Black,
+                        focusedContainerColor = if (darkModeEnabled) Color.White.copy(alpha = 0.05f) else Color.Transparent,
+                        unfocusedContainerColor = if (darkModeEnabled) Color.White.copy(alpha = 0.02f) else Color.Transparent
                     ),
                     modifier = Modifier.fillMaxWidth().testTag("password_input")
                 )
 
+                if (loginError != null) {
+                    Text(
+                        text = loginError ?: "",
+                        color = AlertRed,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+
+                if (loginSuccessMessage != null) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(Icons.Default.CheckCircle, "Success", tint = MintEmerald, modifier = Modifier.size(14.dp))
+                        Text(
+                            text = loginSuccessMessage ?: "",
+                            color = MintEmerald,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
                 Button(
                     onClick = {
                         if (nameInput.isNotBlank()) {
-                            viewModel.signIn(nameInput)
+                            viewModel.signInWithCredentials(nameInput, passwordInput) { success, msg ->
+                                if (success) {
+                                    loginSuccessMessage = msg
+                                    loginError = null
+                                } else {
+                                    loginError = msg
+                                    loginSuccessMessage = null
+                                }
+                            }
                         }
                     },
                     enabled = nameInput.isNotBlank(),
@@ -339,6 +451,35 @@ fun LoginScreen(viewModel: MainViewModel) {
                         color = Color.White
                     )
                 }
+
+                // Database Storage Security Indicators for Passkey and Finger Auth
+                Divider(color = Color.Gray.copy(alpha = 0.2f), thickness = 1.dp)
+                
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Icon(Icons.Default.VpnKey, "Passkey", tint = MintEmerald, modifier = Modifier.size(12.dp))
+                            Text("Database Passkey Auth", fontSize = 11.sp, color = Color.Gray)
+                        }
+                        Text("Active & Encrypted", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MintEmerald)
+                    }
+                    
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Icon(Icons.Default.Fingerprint, "Finger", tint = MintEmerald, modifier = Modifier.size(12.dp))
+                            Text("Database Fingerprint Auth", fontSize = 11.sp, color = Color.Gray)
+                        }
+                        Text("Ready & Synced", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MintEmerald)
+                    }
+                }
             }
         }
     }
@@ -348,6 +489,7 @@ fun LoginScreen(viewModel: MainViewModel) {
 fun BiometricGateScreen(viewModel: MainViewModel) {
     val userName by viewModel.userName.collectAsState()
     val darkModeEnabled by viewModel.darkModeEnabled.collectAsState()
+    val familyConfig by viewModel.familyConfig.collectAsState()
     val scope = rememberCoroutineScope()
     
     var showScanAnimation by remember { mutableStateOf(false) }
@@ -393,244 +535,415 @@ fun BiometricGateScreen(viewModel: MainViewModel) {
             ),
         contentAlignment = Alignment.Center
     ) {
+        // Locked App watermark in background
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(24.dp)
+                .align(Alignment.TopCenter)
+                .offset(y = 40.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.Lock,
+                contentDescription = null,
+                tint = if (darkModeEnabled) Color.White.copy(alpha = 0.05f) else Color.Black.copy(alpha = 0.03f),
+                modifier = Modifier.size(100.dp)
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = "SECURE WALLET VAULT",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Black,
+                color = if (darkModeEnabled) Color.White.copy(alpha = 0.08f) else Color.Black.copy(alpha = 0.05f),
+                letterSpacing = 2.sp
+            )
+        }
+
+        // WebAuthn Browser Dialog Frame
         Card(
-            shape = RoundedCornerShape(28.dp),
+            shape = RoundedCornerShape(24.dp),
             colors = CardDefaults.cardColors(
-                containerColor = if (darkModeEnabled) SophisticatedDarkSurface.copy(alpha = 0.9f) else Color.White
+                containerColor = if (darkModeEnabled) SophisticatedDarkSurface.copy(alpha = 0.95f) else Color.White
             ),
             modifier = Modifier
-                .fillMaxWidth(0.9f)
+                .fillMaxWidth(0.92f)
                 .border(
-                    width = 1.dp,
-                    color = if (darkModeEnabled) SophisticatedBorder.copy(alpha = 0.4f) else Color.LightGray.copy(alpha = 0.5f),
-                    shape = RoundedCornerShape(28.dp)
+                    width = 1.5.dp,
+                    color = if (darkModeEnabled) NeonIndigo.copy(alpha = 0.4f) else Color.LightGray.copy(alpha = 0.5f),
+                    shape = RoundedCornerShape(24.dp)
                 )
                 .testTag("biometric_gate_card")
         ) {
             Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(28.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(20.dp)
+                modifier = Modifier.fillMaxWidth()
             ) {
-                // Secure header icon
-                Icon(
-                    imageVector = if (usePinFallback) Icons.Default.Lock else Icons.Default.Security,
-                    contentDescription = "Secure Mode",
-                    tint = if (showScanAnimation) MintEmerald else NeonIndigo,
-                    modifier = Modifier.size(48.dp)
-                )
-
-                Text(
-                    text = if (usePinFallback) "Enter Security PIN" else "Welcome Back, $userName",
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = if (darkModeEnabled) Color.White else Color.Black,
-                    textAlign = TextAlign.Center
-                )
-
-                Text(
-                    text = if (usePinFallback) {
-                        "Enter your 4-digit security PIN to unlock"
-                    } else {
-                        "Biometric vault protection is enabled for your accounts"
-                    },
-                    fontSize = 12.sp,
-                    color = Color.Gray,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(horizontal = 8.dp)
-                )
-
-                if (!usePinFallback) {
-                    // Fingerprint scanner with pulsing scale and sweep
-                    Box(
-                        modifier = Modifier
-                            .size(140.dp)
-                            .clip(CircleShape)
-                            .background(
-                                if (showScanAnimation) MintEmerald.copy(alpha = 0.1f) else Color(0xFF1F1E2E)
+                // Browser Window Chrome Header (Dynamic URL Bar representing a WebAuthn API prompt inside streaming emulator browser)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(if (darkModeEnabled) Color(0xFF1E2130) else Color(0xFFF3F4F6))
+                        .padding(horizontal = 16.dp, vertical = 10.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        // Window controls
+                        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                            Box(modifier = Modifier.size(8.dp).background(AlertRed, CircleShape))
+                            Box(modifier = Modifier.size(8.dp).background(Color(0xFFFBBF24), CircleShape))
+                            Box(modifier = Modifier.size(8.dp).background(MintEmerald, CircleShape))
+                        }
+                        
+                        // Fake Address bar to simulate WebAuthn browser origin validation
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(26.dp)
+                                .background(
+                                    if (darkModeEnabled) Color(0xFF111422) else Color.White,
+                                    RoundedCornerShape(6.dp)
+                                )
+                                .padding(horizontal = 10.dp, vertical = 2.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = "Secure",
+                                tint = MintEmerald,
+                                modifier = Modifier.size(10.dp)
                             )
-                            .border(
-                                width = 2.dp,
-                                color = if (showScanAnimation) MintEmerald else NeonIndigo.copy(alpha = 0.7f),
-                                shape = CircleShape
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "https://ais-dev-2szidfbydwt7yu6r3sg5ob-591948983633.asia-east1.run.app",
+                                fontSize = 9.sp,
+                                color = if (darkModeEnabled) Color.Gray else Color.DarkGray,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
-                            .clickable {
-                                if (!showScanAnimation) {
-                                    scope.launch {
-                                        showScanAnimation = true
-                                        delay(1500)
-                                        viewModel.authenticateBiometrics(true)
-                                        showScanAnimation = false
-                                    }
-                                }
-                            }
-                            .testTag("fingerprint_scan_trigger"),
-                        contentAlignment = Alignment.Center
+                        }
+
+                        // WebAuthn protocol badge
+                        Box(
+                            modifier = Modifier
+                                .background(NeonIndigo.copy(alpha = 0.15f), RoundedCornerShape(4.dp))
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = "WEBAUTHN",
+                                fontSize = 8.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = NeonIndigo
+                            )
+                        }
+                    }
+                }
+
+                Divider(color = if (darkModeEnabled) Color.Gray.copy(alpha = 0.15f) else Color.LightGray.copy(alpha = 0.3f))
+
+                // Primary WebAuthn Prompt body
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    // Browser WebAuthn prompt title & subtitle
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Fingerprint,
-                            contentDescription = "Fingerprint Sensor",
+                            imageVector = if (usePinFallback) Icons.Default.Lock else Icons.Default.Fingerprint,
+                            contentDescription = "WebAuthn Prompt",
                             tint = if (showScanAnimation) MintEmerald else NeonIndigo,
-                            modifier = Modifier
-                                .size(76.dp)
-                                .then(if (showScanAnimation) Modifier else Modifier.graphicsLayer(scaleX = scale, scaleY = scale))
+                            modifier = Modifier.size(24.dp)
                         )
-
-                        if (showScanAnimation) {
-                            Canvas(modifier = Modifier.fillMaxSize()) {
-                                val y = size.height * laserYOffset
-                                drawLine(
-                                    color = MintEmerald,
-                                    start = Offset(x = size.width * 0.15f, y = y),
-                                    end = Offset(x = size.width * 0.85f, y = y),
-                                    strokeWidth = 3.dp.toPx(),
-                                    cap = StrokeCap.Round
-                                )
-                            }
-                        }
+                        Text(
+                            text = "WebAuthn Biometric Prompt",
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Black,
+                            color = if (darkModeEnabled) Color.White else Color.Black
+                        )
                     }
 
                     Text(
-                        text = if (showScanAnimation) "Verifying identity..." else "Tap fingerprint reader to unlock",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = if (showScanAnimation) MintEmerald else Color.Gray,
-                        textAlign = TextAlign.Center
+                        text = if (usePinFallback) {
+                            "Enter the 4-digit account security PIN configured for $userName"
+                        } else {
+                            "Confirm your identity via browser biometric authenticator or FIDO2 key registered for $userName"
+                        },
+                        fontSize = 11.5.sp,
+                        color = Color.Gray,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 6.dp)
                     )
 
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    TextButton(
-                        onClick = { usePinFallback = true },
-                        modifier = Modifier.testTag("fallback_pin_button")
-                    ) {
-                        Text(
-                            text = "Use Fallback PIN Code",
-                            color = NeonIndigo,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp
-                        )
-                    }
-                } else {
-                    // PIN dots entry indicator
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(16.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(vertical = 8.dp)
-                    ) {
-                        repeat(4) { idx ->
-                            val active = idx < pinInput.length
-                            Box(
+                    if (!usePinFallback) {
+                        // Fingerprint scanner with pulsing scale and sweep
+                        Box(
+                            modifier = Modifier
+                                .size(130.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    if (showScanAnimation) MintEmerald.copy(alpha = 0.1f) else NeonIndigo.copy(alpha = 0.05f)
+                                )
+                                .border(
+                                    width = 2.dp,
+                                    color = if (showScanAnimation) MintEmerald else NeonIndigo.copy(alpha = 0.6f),
+                                    shape = CircleShape
+                                )
+                                .clickable {
+                                    if (!showScanAnimation) {
+                                        scope.launch {
+                                            showScanAnimation = true
+                                            delay(1500)
+                                            viewModel.authenticateBiometrics(true)
+                                            showScanAnimation = false
+                                        }
+                                    }
+                                }
+                                .testTag("fingerprint_scan_trigger"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Fingerprint,
+                                contentDescription = "Fingerprint Sensor",
+                                tint = if (showScanAnimation) MintEmerald else NeonIndigo,
                                 modifier = Modifier
-                                    .size(16.dp)
-                                    .clip(CircleShape)
-                                    .background(
-                                        if (pinError) AlertRed
-                                        else if (active) NeonIndigo
-                                        else Color.Gray.copy(alpha = 0.3f)
-                                    )
-                                    .border(
-                                        width = 1.dp,
-                                        color = if (active) Color.Transparent else Color.Gray.copy(alpha = 0.5f),
-                                        shape = CircleShape
-                                    )
+                                    .size(68.dp)
+                                    .then(if (showScanAnimation) Modifier else Modifier.graphicsLayer(scaleX = scale, scaleY = scale))
                             )
-                        }
-                    }
 
-                    // Touch keypad for fallback PIN
-                    Column(
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)
-                    ) {
-                        val keys = listOf(
-                            listOf("1", "2", "3"),
-                            listOf("4", "5", "6"),
-                            listOf("7", "8", "9"),
-                            listOf("Clear", "0", "Delete")
+                            if (showScanAnimation) {
+                                Canvas(modifier = Modifier.fillMaxSize()) {
+                                    val y = size.height * laserYOffset
+                                    drawLine(
+                                        color = MintEmerald,
+                                        start = Offset(x = size.width * 0.15f, y = y),
+                                        end = Offset(x = size.width * 0.85f, y = y),
+                                        strokeWidth = 3.dp.toPx(),
+                                        cap = StrokeCap.Round
+                                    )
+                                }
+                            }
+                        }
+
+                        Text(
+                            text = if (showScanAnimation) "Authenticating via WebAuthn..." else "Tap scanner above to verify browser biometric session",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (showScanAnimation) MintEmerald else Color.Gray,
+                            textAlign = TextAlign.Center
                         )
 
-                        keys.forEach { row ->
+                        Spacer(modifier = Modifier.height(4.dp))
+
+                        // FIDO2 / WebAuthn Session Metadata Info Card
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(
+                                    if (darkModeEnabled) Color(0xFF141724) else Color(0xFFF3F4F6),
+                                    RoundedCornerShape(12.dp)
+                                )
+                                .padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                horizontalArrangement = Arrangement.SpaceBetween
                             ) {
-                                row.forEach { key ->
-                                    val isSpecial = key == "Clear" || key == "Delete"
-                                    Box(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .height(48.dp)
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .background(
-                                                if (isSpecial) Color.Transparent
-                                                else if (darkModeEnabled) Color(0xFF252438)
-                                                else Color(0xFFE5E7EB)
-                                            )
-                                            .clickable {
-                                                pinError = false
-                                                when (key) {
-                                                    "Clear" -> pinInput = ""
-                                                    "Delete" -> {
-                                                        if (pinInput.isNotEmpty()) {
-                                                            pinInput = pinInput.dropLast(1)
+                                Text("Origin Security Domain", fontSize = 10.sp, color = Color.Gray)
+                                Text("ais-dev-2szidfbydwt7yu6r3sg5ob", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = if (darkModeEnabled) Color.White else Color.Black)
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text("FIDO2 Authenticator Status", fontSize = 10.sp, color = Color.Gray)
+                                Text("Keys Ready in DB 🔑", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MintEmerald)
+                            }
+                        }
+
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextButton(
+                                onClick = { usePinFallback = true },
+                                modifier = Modifier.testTag("fallback_pin_button")
+                            ) {
+                                Text(
+                                    text = "Use Fallback PIN Code",
+                                    color = NeonIndigo,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp
+                                )
+                            }
+                            
+                            Text("|", color = Color.Gray.copy(alpha = 0.5f))
+
+                            TextButton(
+                                onClick = { viewModel.logout() }
+                            ) {
+                                Text(
+                                    text = "Logout",
+                                    color = AlertRed,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp
+                                )
+                            }
+                        }
+                    } else {
+                        // PIN dots entry indicator
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(vertical = 4.dp)
+                        ) {
+                            repeat(4) { idx ->
+                                val active = idx < pinInput.length
+                                Box(
+                                    modifier = Modifier
+                                        .size(16.dp)
+                                        .clip(CircleShape)
+                                        .background(
+                                            if (pinError) AlertRed
+                                            else if (active) NeonIndigo
+                                            else Color.Gray.copy(alpha = 0.3f)
+                                        )
+                                        .border(
+                                            width = 1.dp,
+                                            color = if (active) Color.Transparent else Color.Gray.copy(alpha = 0.5f),
+                                            shape = CircleShape
+                                        )
+                                )
+                            }
+                        }
+
+                        // Touch keypad for fallback PIN
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+                        ) {
+                            val keys = listOf(
+                                listOf("1", "2", "3"),
+                                listOf("4", "5", "6"),
+                                listOf("7", "8", "9"),
+                                listOf("Clear", "0", "Delete")
+                            )
+
+                            keys.forEach { row ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    row.forEach { key ->
+                                        val isSpecial = key == "Clear" || key == "Delete"
+                                        Box(
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .height(48.dp)
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .background(
+                                                    if (isSpecial) Color.Transparent
+                                                    else if (darkModeEnabled) Color(0xFF252438)
+                                                    else Color(0xFFE5E7EB)
+                                                )
+                                                .clickable {
+                                                    pinError = false
+                                                    when (key) {
+                                                        "Clear" -> pinInput = ""
+                                                        "Delete" -> {
+                                                            if (pinInput.isNotEmpty()) {
+                                                                pinInput = pinInput.dropLast(1)
+                                                            }
                                                         }
-                                                    }
-                                                    else -> {
-                                                        if (pinInput.length < 4) {
-                                                            pinInput += key
-                                                            // Auto submit on reaching 4 digits
-                                                            if (pinInput.length == 4) {
-                                                                scope.launch {
-                                                                    delay(400)
-                                                                    // Simulates biometric success on any 4 digits
-                                                                    viewModel.authenticateBiometrics(true)
+                                                        else -> {
+                                                            if (pinInput.length < 4) {
+                                                                pinInput += key
+                                                                // Validate pin code against database config
+                                                                if (pinInput.length == 4) {
+                                                                    scope.launch {
+                                                                        delay(300)
+                                                                        val correctPIN = familyConfig?.storedPasscode?.ifBlank { "1234" } ?: "1234"
+                                                                        if (pinInput == correctPIN) {
+                                                                            viewModel.authenticateBiometrics(true)
+                                                                            pinError = false
+                                                                        } else {
+                                                                            pinError = true
+                                                                            pinInput = ""
+                                                                            viewModel.simulateNotification("Incorrect PIN code entered.")
+                                                                        }
+                                                                    }
                                                                 }
                                                             }
                                                         }
                                                     }
                                                 }
+                                                .testTag("pin_key_$key"),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            if (key == "Delete") {
+                                                Icon(
+                                                    imageVector = Icons.Default.Backspace,
+                                                    contentDescription = "Delete",
+                                                    tint = if (darkModeEnabled) Color.White else Color.Black,
+                                                    modifier = Modifier.size(18.dp)
+                                                )
+                                            } else {
+                                                Text(
+                                                    text = key,
+                                                    fontSize = 15.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = if (isSpecial) NeonIndigo else if (darkModeEnabled) Color.White else Color.Black
+                                                )
                                             }
-                                            .testTag("pin_key_$key"),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        if (key == "Delete") {
-                                            Icon(
-                                                imageVector = Icons.Default.Backspace,
-                                                contentDescription = "Delete",
-                                                tint = if (darkModeEnabled) Color.White else Color.Black,
-                                                modifier = Modifier.size(18.dp)
-                                            )
-                                        } else {
-                                            Text(
-                                                text = key,
-                                                fontSize = 15.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                color = if (isSpecial) NeonIndigo else if (darkModeEnabled) Color.White else Color.Black
-                                            )
                                         }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    TextButton(
-                        onClick = {
-                            usePinFallback = false
-                            pinInput = ""
-                            pinError = false
-                        },
-                        modifier = Modifier.testTag("back_to_biometrics_button")
-                    ) {
-                        Text(
-                            text = "Back to Biometrics",
-                            color = NeonIndigo,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp
-                        )
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextButton(
+                                onClick = {
+                                    usePinFallback = false
+                                    pinInput = ""
+                                    pinError = false
+                                },
+                                modifier = Modifier.weight(1f).testTag("back_to_biometrics_button")
+                            ) {
+                                Text(
+                                    text = "Back to Biometrics",
+                                    color = NeonIndigo,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                            
+                            TextButton(
+                                onClick = { viewModel.logout() },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(
+                                    text = "Logout",
+                                    color = AlertRed,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -754,6 +1067,18 @@ fun MainAppFrame(viewModel: MainViewModel) {
                         )
                     }
 
+                    // Lock screen manual trigger (WebAuthn Browser Prompt)
+                    IconButton(
+                        onClick = { viewModel.lockApp() },
+                        modifier = Modifier.testTag("manual_lock_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = "Lock Screen",
+                            tint = NeonIndigo
+                        )
+                    }
+
                     // Logout
                     IconButton(onClick = { viewModel.logout() }) {
                         Icon(
@@ -861,6 +1186,321 @@ data class TabItem(
 // Helper extension for state-flow mutable creation
 fun <T> mutableStateFlowOf(value: T): MutableState<T> = mutableStateOf(value)
 
+@Composable
+fun EntranceAnimatedContainer(
+    delayMillis: Int = 0,
+    content: @Composable () -> Unit
+) {
+    var visible by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(delayMillis.toLong())
+        visible = true
+    }
+    AnimatedVisibility(
+        visible = visible,
+        enter = slideInVertically(
+            initialOffsetY = { 80 },
+            animationSpec = androidx.compose.animation.core.spring(
+                dampingRatio = androidx.compose.animation.core.Spring.DampingRatioLowBouncy,
+                stiffness = androidx.compose.animation.core.Spring.StiffnessMediumLow
+            )
+        ) + fadeIn(
+            animationSpec = tween(durationMillis = 500)
+        )
+    ) {
+        content()
+    }
+}
+
+@Composable
+fun DashboardEmptyStateView(
+    darkModeEnabled: Boolean,
+    onAddClick: () -> Unit
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "empty_pulse")
+    val pulseScale by infiniteTransition.animateFloat(
+        initialValue = 0.95f,
+        targetValue = 1.05f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1800, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulse_scale"
+    )
+    val rotateAngle by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(15000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "rotate_angle"
+    )
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(24.dp)
+    ) {
+        Spacer(modifier = Modifier.height(20.dp))
+
+        // Custom canvas-drawn modern futuristic holographic scanner radar illustration
+        Box(
+            modifier = Modifier
+                .size(160.dp)
+                .graphicsLayer {
+                    scaleX = pulseScale
+                    scaleY = pulseScale
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val baseRadius = size.width / 2
+
+                // Outer decorative target circle (Dashed)
+                drawCircle(
+                    color = if (darkModeEnabled) SophisticatedPurplePrimary.copy(alpha = 0.2f) else NeonIndigo.copy(alpha = 0.15f),
+                    radius = baseRadius - 10f,
+                    style = Stroke(
+                        width = 1.5.dp.toPx(),
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 12f), 0f)
+                    )
+                )
+
+                // Mid circle showing radar search range
+                drawCircle(
+                    color = if (darkModeEnabled) SophisticatedPurplePrimary.copy(alpha = 0.35f) else NeonIndigo.copy(alpha = 0.25f),
+                    radius = baseRadius - 35f,
+                    style = Stroke(width = 1.dp.toPx())
+                )
+
+                // Inner pulsing hub
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(
+                            (if (darkModeEnabled) SophisticatedPurplePrimary else NeonIndigo).copy(alpha = 0.25f),
+                            Color.Transparent
+                        )
+                    ),
+                    radius = baseRadius - 55f
+                )
+
+                // Sweeping radar arc (rotating)
+                drawArc(
+                    color = if (darkModeEnabled) SophisticatedPurplePrimary.copy(alpha = 0.12f) else NeonIndigo.copy(alpha = 0.08f),
+                    startAngle = rotateAngle,
+                    sweepAngle = 90f,
+                    useCenter = true
+                )
+            }
+
+            // Central icon (glowing safe / scanner icon / Receipt icon)
+            Box(
+                modifier = Modifier
+                    .size(60.dp)
+                    .background(
+                        color = if (darkModeEnabled) SophisticatedPurplePrimary.copy(alpha = 0.15f) else NeonIndigo.copy(alpha = 0.08f),
+                        shape = CircleShape
+                    )
+                    .border(
+                        width = 1.5.dp,
+                        color = if (darkModeEnabled) SophisticatedPurplePrimary.copy(alpha = 0.6f) else NeonIndigo,
+                        shape = CircleShape
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Receipt,
+                    contentDescription = "No Records Tracked Yet",
+                    tint = if (darkModeEnabled) SophisticatedPurplePrimary else NeonIndigo,
+                    modifier = Modifier.size(28.dp)
+                )
+            }
+        }
+
+        // Header and description text
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                text = "Your Ledger is Clean",
+                fontSize = 20.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = if (darkModeEnabled) Color.White else Color.Black,
+                textAlign = TextAlign.Center
+            )
+
+            Text(
+                text = "No recorded transactions or expenses. Log your very first track to initiate the digital scanner, smart breakdown sharing, and AI-driven budget forecasts.",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+                color = if (darkModeEnabled) SophisticatedTextMuted else Color.Gray,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 12.dp),
+                lineHeight = 18.sp
+            )
+        }
+
+        // Primary glowing Call to Action (CTA) Button
+        Button(
+            onClick = onAddClick,
+            modifier = Modifier
+                .fillMaxWidth(0.85f)
+                .height(48.dp)
+                .testTag("add_first_record_button"),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = NeonIndigo,
+                contentColor = Color.White
+            ),
+            shape = RoundedCornerShape(12.dp),
+            contentPadding = PaddingValues(horizontal = 24.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Add,
+                    contentDescription = "Add Track icon",
+                    modifier = Modifier.size(18.dp)
+                )
+                Text(
+                    text = "Add First Record",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        // "Sample Empty No Record Tracks" section
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 4.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "SAMPLE TRACKS (PREVIEW)",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = if (darkModeEnabled) SophisticatedPurplePrimary.copy(alpha = 0.7f) else NeonIndigo.copy(alpha = 0.8f),
+                    letterSpacing = 1.sp
+                )
+                Box(
+                    modifier = Modifier
+                        .background(
+                            color = (if (darkModeEnabled) SophisticatedPurplePrimary else NeonIndigo).copy(alpha = 0.1f),
+                            shape = RoundedCornerShape(4.dp)
+                        )
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        text = "EMPTY STATE",
+                        fontSize = 8.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (darkModeEnabled) SophisticatedPurplePrimary else NeonIndigo
+                    )
+                }
+            }
+
+            // Faint, dashed, stylized sample track cards demonstrating category, title, date, and amount
+            val sampleTracks = listOf(
+                Triple("Grocery purchase", 74.50, "Food & Grocery"),
+                Triple("Starbucks Coffee", 8.25, "Shopping"),
+                Triple("Electricity & Gas", 120.00, "Utilities & Rent")
+            )
+
+            sampleTracks.forEach { (title, amount, category) ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(56.dp)
+                ) {
+                    // Custom Dashed border canvas
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        drawRoundRect(
+                            color = if (darkModeEnabled) SophisticatedBorder.copy(alpha = 0.2f) else Color.Gray.copy(alpha = 0.15f),
+                            style = Stroke(
+                                width = 1.dp.toPx(),
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)
+                            ),
+                            cornerRadius = CornerRadius(10.dp.toPx(), 10.dp.toPx())
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .background(
+                                        color = if (darkModeEnabled) Color.White.copy(alpha = 0.03f) else Color.Black.copy(alpha = 0.02f),
+                                        shape = RoundedCornerShape(6.dp)
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                val icon = when (category) {
+                                    "Food & Grocery" -> Icons.Default.ShoppingCart
+                                    "Shopping" -> Icons.Default.ShoppingBag
+                                    else -> Icons.Default.Receipt
+                                }
+                                Icon(
+                                    imageVector = icon,
+                                    contentDescription = null,
+                                    tint = if (darkModeEnabled) SophisticatedTextMuted.copy(alpha = 0.35f) else Color.Gray.copy(alpha = 0.35f),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+
+                            Column {
+                                Text(
+                                    text = title,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (darkModeEnabled) SophisticatedTextMain.copy(alpha = 0.4f) else Color.Black.copy(alpha = 0.35f)
+                                )
+                                Text(
+                                    text = category,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (darkModeEnabled) SophisticatedTextMuted.copy(alpha = 0.3f) else Color.Gray.copy(alpha = 0.3f)
+                                )
+                            }
+                        }
+
+                        Text(
+                            text = "-$${String.format("%.2f", amount)}",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Black,
+                            color = if (darkModeEnabled) SophisticatedTextMain.copy(alpha = 0.4f) else Color.Black.copy(alpha = 0.35f)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------------- DASHBOARD TAB ----------------
 @Composable
 fun DashboardOverviewSection(viewModel: MainViewModel) {
@@ -872,6 +1512,7 @@ fun DashboardOverviewSection(viewModel: MainViewModel) {
     val partnerName by viewModel.partnerName.collectAsState()
 
     var showAddDialog by remember { mutableStateFlowOf(false) }
+    var editingTransaction by remember { mutableStateOf<com.example.data.TransactionEntity?>(null) }
     var bundleFilter by remember { mutableStateFlowOf<String?>(null) }
     var searchInput by remember { mutableStateFlowOf("") }
     var viewModeShared by remember { mutableStateOf(true) } // true = Family Plan, false = Personal Ledger
@@ -922,15 +1563,23 @@ fun DashboardOverviewSection(viewModel: MainViewModel) {
         label = "laser_y"
     )
 
+    val isLedgerEmpty = transactions.isEmpty()
+
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val isWideScreen = maxWidth >= 600.dp
 
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
+        if (isLedgerEmpty) {
+            DashboardEmptyStateView(
+                darkModeEnabled = darkModeEnabled,
+                onAddClick = { showAddDialog = true }
+            )
+        } else {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
             if (isWideScreen) {
                 // Wide tablet/foldable side-by-side split layout (like responsive Tailwind grid)
                 item {
@@ -945,25 +1594,35 @@ fun DashboardOverviewSection(viewModel: MainViewModel) {
                             modifier = Modifier.weight(1.1f),
                             verticalArrangement = Arrangement.spacedBy(16.dp)
                         ) {
-                            BalanceOverviewCard(
-                                currentBalance = currentBalance,
-                                totalIncome = totalIncome,
-                                totalExpense = totalExpense,
-                                totalInvestment = totalInvestment
-                            )
+                            EntranceAnimatedContainer(delayMillis = 100) {
+                                BalanceOverviewCard(
+                                    currentBalance = currentBalance,
+                                    totalIncome = totalIncome,
+                                    totalExpense = totalExpense,
+                                    totalInvestment = totalInvestment
+                                )
+                            }
 
-                            HomeWidgetInstallationCard(darkModeEnabled = darkModeEnabled)
+                            EntranceAnimatedContainer(delayMillis = 200) {
+                                HomeWidgetInstallationCard(darkModeEnabled = darkModeEnabled)
+                            }
 
-                            CalendarHeatmapCard(transactions = transactions, darkModeEnabled = darkModeEnabled)
+                            EntranceAnimatedContainer(delayMillis = 300) {
+                                CalendarHeatmapCard(transactions = transactions, darkModeEnabled = darkModeEnabled)
+                            }
 
-                            SpendingShareCard(darkModeEnabled = darkModeEnabled)
+                            EntranceAnimatedContainer(delayMillis = 400) {
+                                SpendingShareCard(darkModeEnabled = darkModeEnabled)
+                            }
 
-                            HolographicScannerSummaryCard(
-                                isChartScanning = isChartScanning,
-                                calibrationMessage = calibrationMessage,
-                                scannedMonthIndex = scannedMonthIndex,
-                                months = months
-                            )
+                            EntranceAnimatedContainer(delayMillis = 500) {
+                                HolographicScannerSummaryCard(
+                                    isChartScanning = isChartScanning,
+                                    calibrationMessage = calibrationMessage,
+                                    scannedMonthIndex = scannedMonthIndex,
+                                    months = months
+                                )
+                            }
                         }
 
                         // Right Column: Spending Trends Chart with Scanner Digital Functionality
@@ -971,28 +1630,96 @@ fun DashboardOverviewSection(viewModel: MainViewModel) {
                             modifier = Modifier.weight(1f),
                             verticalArrangement = Arrangement.spacedBy(16.dp)
                         ) {
-                            ScannerSpendingTrendsChart(
-                                darkModeEnabled = darkModeEnabled,
-                                isChartScanning = isChartScanning,
-                                onScanToggle = {
-                                    isChartScanning = !isChartScanning
-                                    calibrationMessage = if (isChartScanning) {
-                                        "SCANNER IDLE: Tap chart bars to audit"
-                                    } else {
-                                        "SCANNING ACTIVE: Performing live digital OCR sweeps..."
+                            EntranceAnimatedContainer(delayMillis = 250) {
+                                ScannerSpendingTrendsChart(
+                                    darkModeEnabled = darkModeEnabled,
+                                    isChartScanning = isChartScanning,
+                                    onScanToggle = {
+                                        isChartScanning = !isChartScanning
+                                        calibrationMessage = if (isChartScanning) {
+                                            "SCANNER IDLE: Tap chart bars to audit"
+                                        } else {
+                                            "SCANNING ACTIVE: Performing live digital OCR sweeps..."
+                                        }
+                                    },
+                                    laserOffset = laserOffset,
+                                    months = months,
+                                    expenseValues = expenseValues,
+                                    maxVal = maxVal,
+                                    scannedMonthIndex = scannedMonthIndex,
+                                    onMonthSelect = { idx ->
+                                        scannedMonthIndex = idx
+                                        calibrationMessage = "AUDITING DETECTED: Sector ${months[idx]} parsed successfully"
                                     }
-                                },
-                                laserOffset = laserOffset,
-                                months = months,
-                                expenseValues = expenseValues,
-                                maxVal = maxVal,
-                                scannedMonthIndex = scannedMonthIndex,
-                                onMonthSelect = { idx ->
-                                    scannedMonthIndex = idx
-                                    calibrationMessage = "AUDITING DETECTED: Sector ${months[idx]} parsed successfully"
-                                }
-                            )
+                                )
+                            }
 
+                            if (scannedMonthIndex != null) {
+                                EntranceAnimatedContainer(delayMillis = 450) {
+                                    ScannedAnalysisDetailCard(
+                                        scannedMonthIndex = scannedMonthIndex,
+                                        months = months,
+                                        expenseValues = expenseValues
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Compact Screen layout: Stack cards sequentially
+                item {
+                    EntranceAnimatedContainer(delayMillis = 100) {
+                        BalanceOverviewCard(
+                            currentBalance = currentBalance,
+                            totalIncome = totalIncome,
+                            totalExpense = totalExpense,
+                            totalInvestment = totalInvestment
+                        )
+                    }
+                }
+
+                item {
+                    EntranceAnimatedContainer(delayMillis = 200) {
+                        HomeWidgetInstallationCard(darkModeEnabled = darkModeEnabled)
+                    }
+                }
+
+                item {
+                    EntranceAnimatedContainer(delayMillis = 300) {
+                        CalendarHeatmapCard(transactions = transactions, darkModeEnabled = darkModeEnabled)
+                    }
+                }
+
+                item {
+                    EntranceAnimatedContainer(delayMillis = 400) {
+                        ScannerSpendingTrendsChart(
+                            darkModeEnabled = darkModeEnabled,
+                            isChartScanning = isChartScanning,
+                            onScanToggle = {
+                                isChartScanning = !isChartScanning
+                                calibrationMessage = if (isChartScanning) {
+                                    "SCANNER IDLE: Tap chart bars to audit"
+                                } else {
+                                    "SCANNING ACTIVE: Performing live digital OCR sweeps..."
+                                }
+                            },
+                            laserOffset = laserOffset,
+                            months = months,
+                            expenseValues = expenseValues,
+                            maxVal = maxVal,
+                            scannedMonthIndex = scannedMonthIndex,
+                            onMonthSelect = { idx ->
+                                scannedMonthIndex = idx
+                                calibrationMessage = "AUDITING DETECTED: Sector ${months[idx]} parsed successfully"
+                            }
+                        )
+                    }
+                }
+
+                if (scannedMonthIndex != null) {
+                    item {
+                        EntranceAnimatedContainer(delayMillis = 500) {
                             ScannedAnalysisDetailCard(
                                 scannedMonthIndex = scannedMonthIndex,
                                 months = months,
@@ -1001,70 +1728,22 @@ fun DashboardOverviewSection(viewModel: MainViewModel) {
                         }
                     }
                 }
-            } else {
-                // Compact Screen layout: Stack cards sequentially
-                item {
-                    BalanceOverviewCard(
-                        currentBalance = currentBalance,
-                        totalIncome = totalIncome,
-                        totalExpense = totalExpense,
-                        totalInvestment = totalInvestment
-                    )
-                }
 
                 item {
-                    HomeWidgetInstallationCard(darkModeEnabled = darkModeEnabled)
-                }
-
-                item {
-                    CalendarHeatmapCard(transactions = transactions, darkModeEnabled = darkModeEnabled)
-                }
-
-                item {
-                    ScannerSpendingTrendsChart(
-                        darkModeEnabled = darkModeEnabled,
-                        isChartScanning = isChartScanning,
-                        onScanToggle = {
-                            isChartScanning = !isChartScanning
-                            calibrationMessage = if (isChartScanning) {
-                                "SCANNER IDLE: Tap chart bars to audit"
-                            } else {
-                                "SCANNING ACTIVE: Performing live digital OCR sweeps..."
-                            }
-                        },
-                        laserOffset = laserOffset,
-                        months = months,
-                        expenseValues = expenseValues,
-                        maxVal = maxVal,
-                        scannedMonthIndex = scannedMonthIndex,
-                        onMonthSelect = { idx ->
-                            scannedMonthIndex = idx
-                            calibrationMessage = "AUDITING DETECTED: Sector ${months[idx]} parsed successfully"
-                        }
-                    )
-                }
-
-                if (scannedMonthIndex != null) {
-                    item {
-                        ScannedAnalysisDetailCard(
-                            scannedMonthIndex = scannedMonthIndex,
-                            months = months,
-                            expenseValues = expenseValues
-                        )
+                    EntranceAnimatedContainer(delayMillis = 600) {
+                        SpendingShareCard(darkModeEnabled = darkModeEnabled)
                     }
                 }
 
                 item {
-                    SpendingShareCard(darkModeEnabled = darkModeEnabled)
-                }
-
-                item {
-                    HolographicScannerSummaryCard(
-                        isChartScanning = isChartScanning,
-                        calibrationMessage = calibrationMessage,
-                        scannedMonthIndex = scannedMonthIndex,
-                        months = months
-                    )
+                    EntranceAnimatedContainer(delayMillis = 700) {
+                        HolographicScannerSummaryCard(
+                            isChartScanning = isChartScanning,
+                            calibrationMessage = calibrationMessage,
+                            scannedMonthIndex = scannedMonthIndex,
+                            months = months
+                        )
+                    }
                 }
             }
 
@@ -1403,6 +2082,7 @@ fun DashboardOverviewSection(viewModel: MainViewModel) {
                 items(filteredTransactions, key = { it.id }) { tx ->
                     TransactionRow(
                         tx = tx,
+                        onEdit = { editingTransaction = tx },
                         onDelete = { viewModel.deleteTransaction(tx) },
                         darkModeEnabled = darkModeEnabled
                     )
@@ -1413,6 +2093,7 @@ fun DashboardOverviewSection(viewModel: MainViewModel) {
             item { Spacer(modifier = Modifier.height(24.dp)) }
         }
     }
+}
 
     // Add Record dialog
     if (showAddDialog) {
@@ -1422,6 +2103,34 @@ fun DashboardOverviewSection(viewModel: MainViewModel) {
             onSave = { title, amt, type, cat, bundle, customDate ->
                 viewModel.addTransaction(title, amt, type, cat, bundle, customDate)
                 showAddDialog = false
+            }
+        )
+    }
+
+    // Edit Record dialog
+    if (editingTransaction != null) {
+        val tx = editingTransaction!!
+        AddRecordDialog(
+            viewModel = viewModel,
+            dialogTitle = "Edit Tracked Record",
+            initialTitle = tx.title,
+            initialAmount = tx.amount,
+            initialType = tx.type,
+            initialCategory = tx.category,
+            initialBundleName = tx.bundleName,
+            initialDate = tx.date,
+            onDismiss = { editingTransaction = null },
+            onSave = { title, amt, type, cat, bundle, customDate ->
+                val updatedTx = tx.copy(
+                    title = title,
+                    amount = amt,
+                    type = type,
+                    category = cat,
+                    bundleName = bundle,
+                    date = customDate ?: tx.date
+                )
+                viewModel.updateTransaction(updatedTx)
+                editingTransaction = null
             }
         )
     }
@@ -2000,7 +2709,7 @@ fun HolographicScannerSummaryCard(
 }
 
 @Composable
-fun TransactionRow(tx: TransactionEntity, onDelete: () -> Unit, darkModeEnabled: Boolean) {
+fun TransactionRow(tx: TransactionEntity, onEdit: () -> Unit, onDelete: () -> Unit, darkModeEnabled: Boolean) {
     val categoryIcon = when (tx.category.lowercase()) {
         "food", "food & grocery", "grocery" -> Icons.Default.ShoppingCart
         "salary" -> Icons.Default.ArrowDownward
@@ -2104,6 +2813,15 @@ fun TransactionRow(tx: TransactionEntity, onDelete: () -> Unit, darkModeEnabled:
                     color = iconColor
                 )
 
+                IconButton(onClick = onEdit, modifier = Modifier.size(28.dp).testTag("edit_transaction_button")) {
+                    Icon(
+                        imageVector = Icons.Default.Edit,
+                        contentDescription = "Edit",
+                        tint = if (darkModeEnabled) Color.LightGray.copy(alpha = 0.8f) else Color.Gray.copy(alpha = 0.8f),
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+
                 IconButton(onClick = onDelete, modifier = Modifier.size(28.dp)) {
                     Icon(
                         imageVector = Icons.Default.Delete,
@@ -2120,11 +2838,14 @@ fun TransactionRow(tx: TransactionEntity, onDelete: () -> Unit, darkModeEnabled:
 @Composable
 fun AddRecordDialog(
     viewModel: MainViewModel,
+    dialogTitle: String = "Add Custom Tracked Record",
     initialSelectedCardId: Int? = null,
     initialTitle: String? = null,
     initialAmount: Double? = null,
     initialType: String? = null,
     initialCategory: String? = null,
+    initialBundleName: String? = null,
+    initialDate: Long? = null,
     onDismiss: () -> Unit,
     onSave: (String, Double, String, String, String?, Long?) -> Unit
 ) {
@@ -2137,11 +2858,17 @@ fun AddRecordDialog(
     var amount by remember { mutableStateOf(initialAmount?.let { if (it > 0.0) String.format("%.2f", it) else "" } ?: "") }
     var type by remember { mutableStateOf(initialType ?: "EXPENSE") }
     var category by remember { mutableStateOf(initialCategory ?: "Food & Grocery") }
-    var bundleName by remember { mutableStateOf("") }
+    var bundleName by remember { mutableStateOf(initialBundleName ?: "") }
 
     // Date state
-    var dateSelectionMode by remember { mutableStateOf("TODAY") } // "TODAY", "YESTERDAY", "CUSTOM"
-    var customDateString by remember { mutableStateOf(SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())) }
+    var dateSelectionMode by remember { mutableStateOf(if (initialDate != null) "CUSTOM" else "TODAY") } // "TODAY", "YESTERDAY", "CUSTOM"
+    var customDateString by remember {
+        mutableStateOf(
+            SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(
+                initialDate?.let { Date(it) } ?: Date()
+            )
+        )
+    }
 
     // Selected Tracker Link state
     var selectedGoalId by remember { mutableStateOf<Int?>(null) }
@@ -2180,7 +2907,7 @@ fun AddRecordDialog(
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 Text(
-                    text = "Add Custom Tracked Record",
+                    text = dialogTitle,
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color.White
@@ -2319,7 +3046,7 @@ fun AddRecordDialog(
                                         singleLine = true,
                                         colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = NeonIndigo),
                                         textStyle = LocalTextStyle.current.copy(fontSize = 11.sp),
-                                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                                        modifier = Modifier.fillMaxWidth().height(56.dp)
                                     )
                                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                         OutlinedTextField(
@@ -2329,7 +3056,7 @@ fun AddRecordDialog(
                                             singleLine = true,
                                             colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = NeonIndigo),
                                             textStyle = LocalTextStyle.current.copy(fontSize = 11.sp),
-                                            modifier = Modifier.weight(1f).height(48.dp)
+                                            modifier = Modifier.weight(1f).height(56.dp)
                                         )
                                         OutlinedTextField(
                                             value = inlineCardLimit,
@@ -2338,7 +3065,7 @@ fun AddRecordDialog(
                                             singleLine = true,
                                             colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = NeonIndigo),
                                             textStyle = LocalTextStyle.current.copy(fontSize = 11.sp),
-                                            modifier = Modifier.weight(1.2f).height(48.dp)
+                                            modifier = Modifier.weight(1.2f).height(56.dp)
                                         )
                                     }
                                     Button(
@@ -2508,7 +3235,7 @@ fun AddRecordDialog(
                                         singleLine = true,
                                         colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = SunsetCoral),
                                         textStyle = LocalTextStyle.current.copy(fontSize = 11.sp),
-                                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                                        modifier = Modifier.fillMaxWidth().height(56.dp)
                                     )
                                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                         OutlinedTextField(
@@ -2518,9 +3245,9 @@ fun AddRecordDialog(
                                             singleLine = true,
                                             colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = SunsetCoral),
                                             textStyle = LocalTextStyle.current.copy(fontSize = 11.sp),
-                                            modifier = Modifier.weight(1f).height(48.dp)
+                                            modifier = Modifier.weight(1f).height(56.dp)
                                         )
-                                        Box(modifier = Modifier.weight(1f).height(48.dp).padding(top = 4.dp)) {
+                                        Box(modifier = Modifier.weight(1f).height(56.dp).padding(top = 4.dp)) {
                                             var expandedInlinePeriod by remember { mutableStateOf(false) }
                                             Button(
                                                 onClick = { expandedInlinePeriod = true },
@@ -3199,7 +3926,7 @@ fun BudgetsDashboardSection(
                 }
             }
         } else {
-            items(categoryBudgets) { budget ->
+            itemsIndexed(categoryBudgets) { index, budget ->
                 val categorySpent = transactions.filter { tx ->
                     tx.category.lowercase() == budget.category.lowercase() &&
                     tx.type == "EXPENSE" &&
@@ -3216,7 +3943,8 @@ fun BudgetsDashboardSection(
                     else -> MintEmerald
                 }
 
-                Card(
+                EntranceAnimatedContainer(delayMillis = 200 + index * 80) {
+                    Card(
                     shape = RoundedCornerShape(16.dp),
                     colors = CardDefaults.cardColors(containerColor = SophisticatedDarkSurface),
                     modifier = Modifier.fillMaxWidth().border(1.dp, SophisticatedBorder.copy(alpha = 0.3f), RoundedCornerShape(16.dp))
@@ -3264,6 +3992,7 @@ fun BudgetsDashboardSection(
                             }
                         }
                     }
+                }
                 }
             }
         }
@@ -4993,7 +5722,7 @@ fun FamilyTab(viewModel: MainViewModel) {
                                 leadingIcon = { Icon(Icons.Default.Person, "Partner Name", modifier = Modifier.size(16.dp)) },
                                 singleLine = true,
                                 colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = NeonIndigo),
-                                modifier = Modifier.fillMaxWidth().height(48.dp)
+                                modifier = Modifier.fillMaxWidth().height(56.dp)
                             )
 
                             OutlinedTextField(
@@ -5003,7 +5732,7 @@ fun FamilyTab(viewModel: MainViewModel) {
                                 leadingIcon = { Icon(Icons.Default.QrCode, "Code", modifier = Modifier.size(16.dp)) },
                                 singleLine = true,
                                 colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = NeonIndigo),
-                                modifier = Modifier.fillMaxWidth().height(48.dp)
+                                modifier = Modifier.fillMaxWidth().height(56.dp)
                             )
 
                             Button(
@@ -5300,7 +6029,6 @@ fun FamilyTab(viewModel: MainViewModel) {
     }
 }
 
-
 // ---------------- AI SCANNER TAB ----------------
 @Composable
 fun ScannerTab(viewModel: MainViewModel) {
@@ -5313,6 +6041,9 @@ fun ScannerTab(viewModel: MainViewModel) {
     var selectedImageUri by remember { mutableStateOf<Uri?>(null) }
     var selectedDocUri by remember { mutableStateOf<Uri?>(null) }
     var selectedDocType by remember { mutableStateOf<String?>(null) }
+    var selectedFileName by remember { mutableStateOf<String?>(null) }
+    var selectedFileSize by remember { mutableStateOf<String?>(null) }
+    var isReadyToParse by remember { mutableStateOf(false) }
     
     var scanResult by remember { mutableStateOf<ParsedReceipt?>(null) }
     var documentScanResult by remember { mutableStateOf<com.example.data.ParsedDocumentResult?>(null) }
@@ -5340,34 +6071,65 @@ fun ScannerTab(viewModel: MainViewModel) {
             
             selectedDocUri = uri
             selectedDocType = fileType
+            selectedFileName = uri.lastPathSegment ?: "document.$fileType"
+            selectedFileSize = "34.5 KB"
             scanResult = null
             documentScanResult = null
             editableTransactions.clear()
+            isReadyToParse = true
 
             if (fileType == "image") {
                 selectedImageUri = uri
-                viewModel.scanReceiptImage(context, uri) { result ->
-                    scanResult = result
-                }
             } else {
                 selectedImageUri = null
-                viewModel.scanDocumentFile(context, uri, fileType) { result ->
-                    documentScanResult = result
-                    editableTransactions.clear()
-                    result.transactions.forEach { tx ->
-                        editableTransactions.add(
-                            EditableTransactionState(
-                                title = tx.title,
-                                amount = tx.amount.toString(),
-                                type = tx.type,
-                                category = tx.category,
-                                bundleName = tx.bundleName ?: "",
-                                isSelected = true
-                            )
-                        )
-                    }
-                }
             }
+        }
+    }
+
+    var tempCameraUri by remember { mutableStateOf<Uri?>(null) }
+
+    val takePictureLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicture()
+    ) { success: Boolean ->
+        if (success) {
+            val uri = tempCameraUri
+            if (uri != null) {
+                selectedDocUri = uri
+                selectedDocType = "image"
+                selectedFileName = "camera_capture_receipt.jpg"
+                selectedFileSize = "Captured via Camera"
+                scanResult = null
+                documentScanResult = null
+                editableTransactions.clear()
+                isReadyToParse = true
+                selectedImageUri = uri
+            }
+        }
+    }
+
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted: Boolean ->
+        if (isGranted) {
+            try {
+                val file = java.io.File(context.cacheDir, "camera_capture_receipt.jpg")
+                if (file.exists()) {
+                    file.delete()
+                }
+                file.createNewFile()
+                val uri = androidx.core.content.FileProvider.getUriForFile(
+                    context,
+                    "${context.packageName}.provider",
+                    file
+                )
+                tempCameraUri = uri
+                takePictureLauncher.launch(uri)
+            } catch (e: Exception) {
+                android.util.Log.e("ScannerTab", "Failed to create temp file or launch camera: ${e.message}", e)
+                viewModel.simulateNotification("Failed to open camera: ${e.localizedMessage}")
+            }
+        } else {
+            viewModel.simulateNotification("Camera permission is required to scan receipts.")
         }
     }
 
@@ -5393,7 +6155,7 @@ fun ScannerTab(viewModel: MainViewModel) {
             }
         }
 
-        // Scanning UI Upload Box
+        // Scanning UI Upload Box (Drag & Drop Dropzone Refactored Style)
         item {
             Card(
                 shape = RoundedCornerShape(24.dp),
@@ -5402,17 +6164,34 @@ fun ScannerTab(viewModel: MainViewModel) {
                 ),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(200.dp)
-                    .clickable { documentPickerLauncher.launch("*/*") }
+                    .height(230.dp)
                     .border(
                         1.dp,
-                        SophisticatedBorder.copy(alpha = 0.3f),
+                        if (darkModeEnabled) SophisticatedBorder.copy(alpha = 0.2f) else Color.LightGray.copy(alpha = 0.3f),
                         RoundedCornerShape(24.dp)
                     )
             ) {
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    // Custom Dashed Border on Canvas
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        drawRoundRect(
+                            color = if (darkModeEnabled) NeonIndigo.copy(alpha = 0.6f) else Color.Gray.copy(alpha = 0.4f),
+                            style = Stroke(
+                                width = 2.dp.toPx(),
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(15f, 15f), 0f)
+                            ),
+                            cornerRadius = CornerRadius(24.dp.toPx(), 24.dp.toPx())
+                        )
+                    }
+
                     if (selectedDocUri == null) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(16.dp)) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(16.dp)
+                        ) {
                             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                 Icon(
                                     imageVector = Icons.Default.CloudUpload,
@@ -5433,65 +6212,147 @@ fun ScannerTab(viewModel: MainViewModel) {
                                     modifier = Modifier.size(36.dp)
                                 )
                             }
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Text("Upload File or Image", fontWeight = FontWeight.Bold, color = if (darkModeEnabled) Color.White else Color.Black)
-                            Text("Tap to browse Images, PDFs, or CSV files", fontSize = 11.sp, color = Color.Gray)
-                        }
-                    } else {
-                        // File metadata or Image view
-                        if (selectedDocType == "image" && selectedImageUri != null) {
-                            Box(modifier = Modifier.fillMaxSize()) {
-                                AsyncImage(
-                                    model = selectedImageUri,
-                                    contentDescription = "Selected Receipt",
-                                    modifier = Modifier.fillMaxSize()
-                                )
-
-                                if (isScanning) {
-                                    val infiniteTransition = rememberInfiniteTransition(label = "laser")
-                                    val position by infiniteTransition.animateFloat(
-                                        initialValue = 0f,
-                                        targetValue = 1f,
-                                        animationSpec = infiniteRepeatable(
-                                            animation = tween(1500),
-                                            repeatMode = RepeatMode.Reverse
-                                        ),
-                                        label = "laser_pos"
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                "DRAG & DROP FILES HERE",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = if (darkModeEnabled) Color.White else Color.Black
+                            )
+                            Text(
+                                "Capture a receipt using your camera or choose a document",
+                                fontSize = 11.sp,
+                                color = Color.Gray
+                            )
+                            Spacer(modifier = Modifier.height(14.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Button(
+                                    onClick = {
+                                        val hasPermission = ContextCompat.checkSelfPermission(
+                                            context, Manifest.permission.CAMERA
+                                        ) == PackageManager.PERMISSION_GRANTED
+                                        if (hasPermission) {
+                                            try {
+                                                val file = java.io.File(context.cacheDir, "camera_capture_receipt.jpg")
+                                                if (file.exists()) {
+                                                    file.delete()
+                                                }
+                                                file.createNewFile()
+                                                val uri = androidx.core.content.FileProvider.getUriForFile(
+                                                    context,
+                                                    "${context.packageName}.provider",
+                                                    file
+                                                )
+                                                tempCameraUri = uri
+                                                takePictureLauncher.launch(uri)
+                                            } catch (e: Exception) {
+                                                android.util.Log.e("ScannerTab", "Failed to create temp file or launch camera: ${e.message}", e)
+                                                viewModel.simulateNotification("Failed to open camera: ${e.localizedMessage}")
+                                            }
+                                        } else {
+                                            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = NeonIndigo),
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier.testTag("camera_capture_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.PhotoCamera,
+                                        contentDescription = "Camera",
+                                        modifier = Modifier.size(16.dp)
                                     )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Capture Receipt", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                }
 
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .fillMaxHeight(0.04f)
-                                            .align(Alignment.TopCenter)
-                                            .graphicsLayerTranslationY(position)
-                                            .background(Brush.horizontalGradient(listOf(Color.Transparent, MintEmerald, Color.Transparent)))
+                                Button(
+                                    onClick = { documentPickerLauncher.launch("*/*") },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color.Gray.copy(alpha = 0.2f)),
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier.testTag("choose_file_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.FolderOpen,
+                                        contentDescription = "Browse Files",
+                                        tint = if (darkModeEnabled) Color.White else Color.Black,
+                                        modifier = Modifier.size(16.dp)
                                     )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Choose File", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = if (darkModeEnabled) Color.White else Color.Black)
                                 }
                             }
-                        } else {
-                            // PDF/CSV selected view
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                val fileIcon = if (selectedDocType == "pdf") Icons.Default.PictureAsPdf else Icons.Default.GridOn
-                                val iconColor = if (selectedDocType == "pdf") SunsetCoral else MintEmerald
-                                
+                        }
+                    } else {
+                        // Context successfully loaded: Displaying metadata & file preview card with clean Action Buttons
+                        Box(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                            Column(
+                                modifier = Modifier.fillMaxSize(),
+                                verticalArrangement = Arrangement.Center,
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                val fileIcon = when (selectedDocType) {
+                                    "pdf" -> Icons.Default.PictureAsPdf
+                                    "csv" -> Icons.Default.GridOn
+                                    else -> Icons.Default.Image
+                                }
+                                val iconColor = when (selectedDocType) {
+                                    "pdf" -> SunsetCoral
+                                    "csv" -> MintEmerald
+                                    else -> NeonIndigo
+                                }
+
                                 Icon(
                                     imageVector = fileIcon,
                                     contentDescription = selectedDocType,
                                     tint = iconColor,
-                                    modifier = Modifier.size(56.dp)
+                                    modifier = Modifier.size(48.dp)
                                 )
                                 Spacer(modifier = Modifier.height(8.dp))
                                 Text(
-                                    text = "Selected ${selectedDocType?.uppercase()} Document",
+                                    text = selectedFileName ?: "Document File",
                                     fontWeight = FontWeight.Bold,
-                                    color = if (darkModeEnabled) Color.White else Color.Black
+                                    fontSize = 14.sp,
+                                    color = if (darkModeEnabled) Color.White else Color.Black,
+                                    textAlign = TextAlign.Center,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.padding(horizontal = 8.dp)
                                 )
                                 Text(
-                                    text = selectedDocUri?.lastPathSegment ?: "Document.file",
+                                    text = "Type: ${selectedDocType?.uppercase()} | Size: ${selectedFileSize ?: "Calculating..."}",
                                     fontSize = 11.sp,
                                     color = Color.Gray
                                 )
+                                Spacer(modifier = Modifier.height(12.dp))
+
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Button(
+                                        onClick = {
+                                            selectedDocUri = null
+                                            selectedDocType = null
+                                            selectedFileName = null
+                                            selectedFileSize = null
+                                            selectedImageUri = null
+                                            scanResult = null
+                                            documentScanResult = null
+                                            editableTransactions.clear()
+                                            isReadyToParse = false
+                                        },
+                                        colors = ButtonDefaults.buttonColors(containerColor = AlertRed.copy(alpha = 0.2f)),
+                                        modifier = Modifier.height(36.dp)
+                                    ) {
+                                        Text("❌ Clear", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = AlertRed)
+                                    }
+
+                                    Button(
+                                        onClick = { documentPickerLauncher.launch("*/*") },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color.Gray.copy(alpha = 0.2f)),
+                                        modifier = Modifier.height(36.dp)
+                                    ) {
+                                        Text("🔄 Change File", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = if (darkModeEnabled) Color.White else Color.Black)
+                                    }
+                                }
                             }
                         }
                     }
@@ -5499,63 +6360,21 @@ fun ScannerTab(viewModel: MainViewModel) {
             }
         }
 
-        // Instant preset scanning buttons for emulator/dry test
-        item {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(
-                    text = "Try an Instant Gemini Document Parser Preset:",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.Gray
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Button(
-                        onClick = {
-                            selectedDocUri = Uri.parse("content://mock_costco_invoice.pdf")
-                            selectedDocType = "pdf"
-                            selectedImageUri = null
-                            scanResult = null
-                            documentScanResult = null
-                            
-                            viewModel.scanDocumentFile(context, Uri.EMPTY, "pdf") { result ->
-                                documentScanResult = result
-                                editableTransactions.clear()
-                                result.transactions.forEach { tx ->
-                                    editableTransactions.add(
-                                        EditableTransactionState(
-                                            title = tx.title,
-                                            amount = tx.amount.toString(),
-                                            type = tx.type,
-                                            category = tx.category,
-                                            bundleName = tx.bundleName ?: "",
-                                            isSelected = true
-                                        )
-                                    )
-                                }
-                            }
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray),
-                        modifier = Modifier.weight(1f),
-                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Icon(Icons.Default.PictureAsPdf, contentDescription = null, tint = SunsetCoral, modifier = Modifier.size(12.dp))
-                            Text("Costco PDF", fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                        }
-                    }
+        // Dedicated Processing trigger button (shown when file is loaded into context)
+        if (selectedDocUri != null && isReadyToParse && !isScanning && !isDocumentScanning) {
+            item {
+                Button(
+                    onClick = {
+                        isReadyToParse = false
+                        val uri = selectedDocUri ?: return@Button
+                        val type = selectedDocType ?: return@Button
 
-                    Button(
-                        onClick = {
-                            selectedDocUri = Uri.parse("content://mock_commute_bank_statement.csv")
-                            selectedDocType = "csv"
-                            selectedImageUri = null
-                            scanResult = null
-                            documentScanResult = null
-                            
-                            viewModel.scanDocumentFile(context, Uri.EMPTY, "csv") { result ->
+                        if (type == "image") {
+                            viewModel.scanReceiptImage(context, uri) { result ->
+                                scanResult = result
+                            }
+                        } else {
+                            viewModel.scanDocumentFile(context, uri, type) { result ->
                                 documentScanResult = result
                                 editableTransactions.clear()
                                 result.transactions.forEach { tx ->
@@ -5571,15 +6390,26 @@ fun ScannerTab(viewModel: MainViewModel) {
                                     )
                                 }
                             }
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray),
-                        modifier = Modifier.weight(1f),
-                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Icon(Icons.Default.GridOn, contentDescription = null, tint = MintEmerald, modifier = Modifier.size(12.dp))
-                            Text("Uber CSV", fontSize = 10.sp, fontWeight = FontWeight.Bold)
                         }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = NeonIndigo),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(54.dp)
+                        .testTag("extract_and_parse_button")
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = Color.White)
+                        Text(
+                            text = "EXTRACT & PARSE WITH GEMINI ✦",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Black,
+                            color = Color.White
+                        )
                     }
                 }
             }
@@ -5652,6 +6482,18 @@ fun ScannerTab(viewModel: MainViewModel) {
                         var pricingAmount by remember(result) { mutableStateOf(result.amount.toString()) }
                         var categorySelection by remember(result) { mutableStateOf(result.category) }
                         var customBundleName by remember { mutableStateOf("") }
+                        var importAsIndividualItems by remember(result) { mutableStateOf(result.items.isNotEmpty()) }
+
+                        val editableReceiptItems = remember(result) {
+                            result.items.map { item ->
+                                EditableReceiptItem(
+                                    name = mutableStateOf(item.name),
+                                    price = mutableStateOf(item.price.toString()),
+                                    category = mutableStateOf(item.category),
+                                    isSelected = mutableStateOf(true)
+                                )
+                            }
+                        }
 
                         OutlinedTextField(
                             value = merchantName,
@@ -5692,20 +6534,301 @@ fun ScannerTab(viewModel: MainViewModel) {
                             modifier = Modifier.fillMaxWidth()
                         )
 
+                        if (result.items.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { importAsIndividualItems = !importAsIndividualItems }
+                                    .padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = importAsIndividualItems,
+                                    onCheckedChange = { importAsIndividualItems = it },
+                                    colors = CheckboxDefaults.colors(checkedColor = MintEmerald)
+                                )
+                                Text(
+                                    text = "Split receipt into individual categorized items",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (darkModeEnabled) Color.White else Color.Black,
+                                    modifier = Modifier.padding(start = 4.dp)
+                                )
+                            }
+                        }
+
+                        if (importAsIndividualItems && editableReceiptItems.isNotEmpty()) {
+                            val activeItems = editableReceiptItems.filter { it.isSelected.value }
+                            val categorySums = activeItems.groupBy { it.category.value }
+                                .mapValues { entry -> 
+                                    entry.value.sumOf { it.price.value.toDoubleOrNull() ?: 0.0 }
+                                }
+                            val totalSum = categorySums.values.sum()
+                            
+                            if (totalSum > 0) {
+                                Card(
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = if (darkModeEnabled) Color(0xFF131722) else Color(0xFFF9FAFB)
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 4.dp)
+                                        .border(
+                                            1.dp,
+                                            MintEmerald.copy(alpha = 0.25f),
+                                            RoundedCornerShape(12.dp)
+                                        )
+                                ) {
+                                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Assessment,
+                                                    contentDescription = "Analytics",
+                                                    tint = MintEmerald,
+                                                    modifier = Modifier.size(14.dp)
+                                                )
+                                                Text(
+                                                    text = "AI Multi-Split Live Impact",
+                                                    fontSize = 11.sp,
+                                                    fontWeight = FontWeight.Black,
+                                                    color = if (darkModeEnabled) Color.White else Color.Black
+                                                )
+                                            }
+                                            Text(
+                                                text = "Split Sum: $${String.format("%.2f", totalSum)}",
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MintEmerald
+                                            )
+                                        }
+
+                                        // Composite bar chart
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(8.dp)
+                                                .clip(RoundedCornerShape(4.dp))
+                                                .background(Color.Gray.copy(alpha = 0.2f))
+                                        ) {
+                                            val sliceColors = listOf(MintEmerald, NeonIndigo, SunsetCoral, Color(0xFF00D2D3), Color(0xFFFF9F43))
+                                            var colorIdx = 0
+                                            categorySums.forEach { (cat, sum) ->
+                                                val weight = (sum / totalSum).toFloat()
+                                                if (weight > 0f) {
+                                                    val color = sliceColors[colorIdx % sliceColors.size]
+                                                    colorIdx++
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .fillMaxHeight()
+                                                            .weight(weight)
+                                                            .background(color)
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        // Category Legends
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .horizontalScroll(rememberScrollState()),
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            val sliceColors = listOf(MintEmerald, NeonIndigo, SunsetCoral, Color(0xFF00D2D3), Color(0xFFFF9F43))
+                                            var colorIdx = 0
+                                            categorySums.forEach { (cat, sum) ->
+                                                val pct = (sum / totalSum * 100).toInt()
+                                                val color = sliceColors[colorIdx % sliceColors.size]
+                                                colorIdx++
+                                                Row(
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                                ) {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .size(6.dp)
+                                                            .clip(CircleShape)
+                                                            .background(color)
+                                                    )
+                                                    Text(
+                                                        text = "$cat ($pct%)",
+                                                        fontSize = 9.sp,
+                                                        color = Color.Gray,
+                                                        fontWeight = FontWeight.Medium
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                        Text(
+                            text = "Item-Level Automated Categorization",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Black,
+                                color = MintEmerald,
+                                modifier = Modifier.padding(top = 4.dp, bottom = 4.dp)
+                            )
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Quick Action:",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.Gray
+                            )
+                            TextButton(
+                                onClick = { editableReceiptItems.forEach { it.isSelected.value = true } },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                modifier = Modifier.height(28.dp).testTag("select_all_receipt_items_button")
+                            ) {
+                                Text("Select All", fontSize = 11.sp, color = MintEmerald)
+                            }
+                            TextButton(
+                                onClick = { editableReceiptItems.forEach { it.isSelected.value = false } },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                modifier = Modifier.height(28.dp).testTag("deselect_all_receipt_items_button")
+                            ) {
+                                Text("Undo All Selection (Deselect)", fontSize = 11.sp, color = SunsetCoral)
+                            }
+                        }
+
+                            editableReceiptItems.forEachIndexed { idx, editableItem ->
+                                Card(
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = if (darkModeEnabled) Color(0xFF1E2436) else Color(0xFFF3F4F6)
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .border(
+                                            1.dp,
+                                            if (darkModeEnabled) Color.Gray.copy(alpha = 0.15f) else Color.LightGray.copy(alpha = 0.3f),
+                                            RoundedCornerShape(12.dp)
+                                        )
+                                ) {
+                                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Checkbox(
+                                                checked = editableItem.isSelected.value,
+                                                onCheckedChange = { editableItem.isSelected.value = it },
+                                                colors = CheckboxDefaults.colors(checkedColor = MintEmerald)
+                                            )
+
+                                            OutlinedTextField(
+                                                value = editableItem.name.value,
+                                                onValueChange = { editableItem.name.value = it },
+                                                label = { Text("Item #${idx + 1}") },
+                                                singleLine = true,
+                                                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 12.sp),
+                                                colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = MintEmerald),
+                                                modifier = Modifier.weight(1.5f)
+                                            )
+                                            
+                                            OutlinedTextField(
+                                                value = editableItem.price.value,
+                                                onValueChange = { editableItem.price.value = it },
+                                                label = { Text("Price ($)") },
+                                                singleLine = true,
+                                                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 12.sp),
+                                                colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = MintEmerald),
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                        }
+
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth().padding(start = 32.dp),
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .background(MintEmerald.copy(alpha = 0.12f), RoundedCornerShape(6.dp))
+                                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                                            ) {
+                                                Row(
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Default.AutoAwesome,
+                                                        contentDescription = "Auto-categorized",
+                                                        tint = MintEmerald,
+                                                        modifier = Modifier.size(10.dp)
+                                                    )
+                                                    Text(
+                                                        text = "Auto-Categorized",
+                                                        fontSize = 9.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = MintEmerald
+                                                    )
+                                                }
+                                            }
+
+                                            OutlinedTextField(
+                                                value = editableItem.category.value,
+                                                onValueChange = { editableItem.category.value = it },
+                                                label = { Text("Category") },
+                                                singleLine = true,
+                                                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 11.sp),
+                                                colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = MintEmerald),
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         Button(
                             onClick = {
-                                val amt = pricingAmount.toDoubleOrNull() ?: 0.0
-                                if (merchantName.isNotBlank() && amt > 0.0) {
-                                    viewModel.addTransaction(
-                                        title = merchantName,
-                                        amount = amt,
-                                        type = "EXPENSE",
-                                        category = categorySelection,
-                                        bundleName = customBundleName
-                                    )
+                                if (importAsIndividualItems && editableReceiptItems.isNotEmpty()) {
+                                    editableReceiptItems.forEach { item ->
+                                        val amt = item.price.value.toDoubleOrNull() ?: 0.0
+                                        if (item.name.value.isNotBlank() && amt > 0.0 && item.isSelected.value) {
+                                            viewModel.addTransaction(
+                                                title = item.name.value,
+                                                amount = amt,
+                                                type = "EXPENSE",
+                                                category = item.category.value,
+                                                bundleName = customBundleName
+                                            )
+                                        }
+                                    }
                                     scanResult = null
                                     selectedImageUri = null
                                     selectedDocUri = null
+                                } else {
+                                    val amt = pricingAmount.toDoubleOrNull() ?: 0.0
+                                    if (merchantName.isNotBlank() && amt > 0.0) {
+                                        viewModel.addTransaction(
+                                            title = merchantName,
+                                            amount = amt,
+                                            type = "EXPENSE",
+                                            category = categorySelection,
+                                            bundleName = customBundleName
+                                        )
+                                        scanResult = null
+                                        selectedImageUri = null
+                                        selectedDocUri = null
+                                    }
                                 }
                             },
                             colors = ButtonDefaults.buttonColors(containerColor = MintEmerald),
@@ -5763,6 +6886,41 @@ fun ScannerTab(viewModel: MainViewModel) {
                             modifier = Modifier.fillMaxWidth(),
                             verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Quick Action:",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.Gray
+                                )
+                                TextButton(
+                                    onClick = { 
+                                        editableTransactions.forEachIndexed { idx, tItem ->
+                                            editableTransactions[idx] = tItem.copy(isSelected = true)
+                                        }
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                    modifier = Modifier.height(28.dp).testTag("select_all_transactions_button")
+                                ) {
+                                    Text("Select All", fontSize = 11.sp, color = NeonIndigo)
+                                }
+                                TextButton(
+                                    onClick = { 
+                                        editableTransactions.forEachIndexed { idx, tItem ->
+                                            editableTransactions[idx] = tItem.copy(isSelected = false)
+                                        }
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                    modifier = Modifier.height(28.dp).testTag("deselect_all_transactions_button")
+                                ) {
+                                    Text("Undo All Selection (Deselect)", fontSize = 11.sp, color = SunsetCoral)
+                                }
+                            }
+
                             editableTransactions.forEachIndexed { index, item ->
                                 Card(
                                     shape = RoundedCornerShape(12.dp),
@@ -5819,7 +6977,7 @@ fun ScannerTab(viewModel: MainViewModel) {
                                             singleLine = true,
                                             colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = NeonIndigo),
                                             textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
-                                            modifier = Modifier.fillMaxWidth().height(48.dp)
+                                            modifier = Modifier.fillMaxWidth().height(56.dp)
                                         )
 
                                         // Row with Amount & Category
@@ -5836,7 +6994,7 @@ fun ScannerTab(viewModel: MainViewModel) {
                                                 singleLine = true,
                                                 colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = NeonIndigo),
                                                 textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
-                                                modifier = Modifier.weight(1f).height(48.dp)
+                                                modifier = Modifier.weight(1f).height(56.dp)
                                             )
 
                                             OutlinedTextField(
@@ -5848,7 +7006,7 @@ fun ScannerTab(viewModel: MainViewModel) {
                                                 singleLine = true,
                                                 colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = NeonIndigo),
                                                 textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
-                                                modifier = Modifier.weight(1.2f).height(48.dp)
+                                                modifier = Modifier.weight(1.2f).height(56.dp)
                                             )
                                         }
 
@@ -5862,7 +7020,7 @@ fun ScannerTab(viewModel: MainViewModel) {
                                             singleLine = true,
                                             colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = NeonIndigo),
                                             textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
-                                            modifier = Modifier.fillMaxWidth().height(48.dp)
+                                            modifier = Modifier.fillMaxWidth().height(56.dp)
                                         )
                                     }
                                 }
@@ -5919,9 +7077,6 @@ fun ReportsTab(viewModel: MainViewModel) {
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
 
-    var showExportPreview by remember { mutableStateFlowOf(false) }
-    var previewType by remember { mutableStateFlowOf("CSV") }
-
     // Aggregate category splits for custom donut charts
     val categories = listOf("Food & Grocery", "Investment", "Shopping", "Travelling", "Bill & Subscription", "Health & Medical", "Entertainment & Gaming", "Education & Self-Care", "Utilities & Rent", "Dine Out & Café", "Mortgages", "Credit Card Expense", "Credit Card Payment", "Bank Repayment", "Miscellaneous")
     val totals = categories.map { cat ->
@@ -5943,6 +7098,96 @@ fun ReportsTab(viewModel: MainViewModel) {
         Color(0xFF2D98DA)  // SkyBlue
     )
 
+    val monthNames = listOf("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    val fullMonthNames = listOf("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December")
+
+    // Default base values for simulated baseline (since the user database might be empty initially)
+    val baseIncome = 6500.0
+    val baseSavings2025 = listOf(2300.0, 2400.0, 2000.0, 2200.0, 2500.0, 2100.0, 1900.0, 2000.0, 2300.0, 2400.0, 1800.0, 1300.0)
+    val baseSavings2026 = listOf(2600.0, 2700.0, 2300.0, 2500.0, 2800.0, 2400.0, 2200.0, 2300.0, 2600.0, 2700.0, 2100.0, 1600.0)
+
+    val baseSpending2025 = baseSavings2025.map { baseIncome - it }
+    val baseSpending2026 = baseSavings2026.map { baseIncome - it }
+
+    val calendar = remember { java.util.Calendar.getInstance() }
+    val actualIncome2025 = remember(transactions) { DoubleArray(12) { 0.0 } }
+    val actualSpending2025 = remember(transactions) { DoubleArray(12) { 0.0 } }
+    val actualIncome2026 = remember(transactions) { DoubleArray(12) { 0.0 } }
+    val actualSpending2026 = remember(transactions) { DoubleArray(12) { 0.0 } }
+
+    // Recompute actual values from transactions flow
+    remember(transactions) {
+        for (i in 0..11) {
+            actualIncome2025[i] = 0.0
+            actualSpending2025[i] = 0.0
+            actualIncome2026[i] = 0.0
+            actualSpending2026[i] = 0.0
+        }
+        transactions.forEach { tx ->
+            calendar.timeInMillis = tx.date
+            val y = calendar.get(java.util.Calendar.YEAR)
+            val m = calendar.get(java.util.Calendar.MONTH)
+            if (m in 0..11) {
+                val amount = tx.amount
+                if (y == 2025) {
+                    if (tx.type == "INCOME" || tx.type == "FAMILY_SHARING") {
+                        actualIncome2025[m] += amount
+                    } else if (tx.type == "EXPENSE" || tx.type == "INVESTMENT") {
+                        actualSpending2025[m] += amount
+                    }
+                } else if (y == 2026) {
+                    if (tx.type == "INCOME" || tx.type == "FAMILY_SHARING") {
+                        actualIncome2026[m] += amount
+                    } else if (tx.type == "EXPENSE" || tx.type == "INVESTMENT") {
+                        actualSpending2026[m] += amount
+                    }
+                }
+            }
+        }
+    }
+
+    val savings2025 = remember(transactions) {
+        DoubleArray(12) { i ->
+            if (actualIncome2025[i] > 0.0 || actualSpending2025[i] > 0.0) {
+                actualIncome2025[i] - actualSpending2025[i]
+            } else {
+                baseSavings2025[i]
+            }
+        }
+    }
+
+    val spending2025 = remember(transactions) {
+        DoubleArray(12) { i ->
+            if (actualIncome2025[i] > 0.0 || actualSpending2025[i] > 0.0) {
+                actualSpending2025[i]
+            } else {
+                baseSpending2025[i]
+            }
+        }
+    }
+
+    val savings2026 = remember(transactions) {
+        DoubleArray(12) { i ->
+            if (actualIncome2026[i] > 0.0 || actualSpending2026[i] > 0.0) {
+                actualIncome2026[i] - actualSpending2026[i]
+            } else {
+                baseSavings2026[i]
+            }
+        }
+    }
+
+    val spending2026 = remember(transactions) {
+        DoubleArray(12) { i ->
+            if (actualIncome2026[i] > 0.0 || actualSpending2026[i] > 0.0) {
+                actualSpending2026[i]
+            } else {
+                baseSpending2026[i]
+            }
+        }
+    }
+
+    var selectedMonthIndex by remember { mutableStateOf(6) } // July by default
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -5958,7 +7203,7 @@ fun ReportsTab(viewModel: MainViewModel) {
                     color = if (darkModeEnabled) Color.White else Color.Black
                 )
                 Text(
-                    text = "Aesthetic donut distributions & data sharing export tools",
+                    text = "Aesthetic donut distributions & dynamic growth analytics",
                     fontSize = 12.sp,
                     color = Color.Gray
                 )
@@ -6126,152 +7371,449 @@ fun ReportsTab(viewModel: MainViewModel) {
             }
         }
 
-        // Beautiful sharing and export buttons
+        // Interactive Year-over-Year Savings Chart (styled exactly like a professional Recharts graph)
         item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            Card(
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (darkModeEnabled) SophisticatedDarkSurface else Color.White
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(
+                        1.dp,
+                        if (darkModeEnabled) SophisticatedBorder.copy(alpha = 0.3f) else Color.LightGray.copy(alpha = 0.4f),
+                        RoundedCornerShape(20.dp)
+                    )
             ) {
-                // Generate CSV Button
-                Button(
-                    onClick = {
-                        val csv = viewModel.generateCsvReport()
-                        clipboardManager.setText(AnnotatedString(csv))
-                        Toast.makeText(context, "Proper Structured CSV copied to clipboard!", Toast.LENGTH_LONG).show()
-                        previewType = "CSV"
-                        showExportPreview = true
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = NeonIndigo),
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.weight(1f)
-                ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Year-over-Year Savings Growth",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = NeonIndigo
+                    )
+                    Text(
+                        text = "Comparing monthly savings of 2026 vs 2025 (Income - Spend)",
+                        fontSize = 11.sp,
+                        color = Color.Gray,
+                        modifier = Modifier.padding(bottom = 12.dp)
+                    )
+
+                    // Line Legends
                     Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
-                        Icon(Icons.Default.Share, "Share", modifier = Modifier.size(16.dp))
-                        Text("Export CSV Table", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Box(modifier = Modifier.size(10.dp).background(NeonIndigo, CircleShape))
+                            Text("2026 Savings", fontSize = 11.sp, color = if (darkModeEnabled) Color.White else Color.Black)
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Box(modifier = Modifier.size(10.dp).background(SunsetCoral, CircleShape))
+                            Text("2025 Savings", fontSize = 11.sp, color = if (darkModeEnabled) Color.White else Color.Black)
+                        }
+                    }
+
+                    // The Canvas
+                    val textMeasurer = rememberTextMeasurer()
+                    val paddingLeft = 45.dp
+                    val paddingRight = 10.dp
+                    val paddingTop = 10.dp
+                    val paddingBottom = 25.dp
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(200.dp)
+                    ) {
+                        val density = LocalDensity.current
+                        val paddingLeftPx = with(density) { paddingLeft.toPx() }
+                        val paddingRightPx = with(density) { paddingRight.toPx() }
+
+                        Canvas(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .pointerInput(Unit) {
+                                    val widthPx = this.size.width
+                                    val plotWidth = widthPx - paddingLeftPx - paddingRightPx
+                                    val xStep = plotWidth / 11f
+                                    
+                                    awaitEachGesture {
+                                        val down = awaitFirstDown()
+                                        val index = ((down.position.x - paddingLeftPx) / xStep).roundToInt().coerceIn(0, 11)
+                                        selectedMonthIndex = index
+                                        
+                                        while (true) {
+                                            val event = awaitPointerEvent()
+                                            val anyPressed = event.changes.any { it.pressed }
+                                            if (!anyPressed) break
+                                            val pos = event.changes.first().position
+                                            val idx = ((pos.x - paddingLeftPx) / xStep).roundToInt().coerceIn(0, 11)
+                                            selectedMonthIndex = idx.coerceIn(0, 11)
+                                        }
+                                    }
+                                }
+                        ) {
+                            val widthPx = size.width
+                            val heightPx = size.height
+
+                            val paddingLeftPx = paddingLeft.toPx()
+                            val paddingRightPx = paddingRight.toPx()
+                            val paddingTopPx = paddingTop.toPx()
+                            val paddingBottomPx = paddingBottom.toPx()
+
+                            val startX = paddingLeftPx
+                            val endX = widthPx - paddingRightPx
+                            val startY = heightPx - paddingBottomPx
+                            val endY = paddingTopPx
+
+                            val plotWidth = endX - startX
+                            val plotHeight = startY - endY
+
+                            // Y axis scale
+                            val minVal = savings2025.minOrNull()?.coerceAtMost(savings2026.minOrNull() ?: 0.0) ?: 0.0
+                            val maxVal = savings2025.maxOrNull()?.coerceAtLeast(savings2026.maxOrNull() ?: 1000.0) ?: 1000.0
+                            val yMin = (minVal * 0.8).coerceAtLeast(0.0)
+                            val yMax = maxVal * 1.15
+                            val yRange = if (yMax > yMin) yMax - yMin else 1.0
+
+                            // 1. Draw horizontal grid lines and Y-axis labels
+                            val gridLineCount = 4
+                            for (j in 0..gridLineCount) {
+                                val v = yMin + (yRange / gridLineCount) * j
+                                val y = startY - (j.toFloat() / gridLineCount) * plotHeight
+                                
+                                // Grid line
+                                drawLine(
+                                    color = if (darkModeEnabled) Color.Gray.copy(alpha = 0.15f) else Color.LightGray.copy(alpha = 0.3f),
+                                    start = Offset(startX, y),
+                                    end = Offset(endX, y),
+                                    strokeWidth = 2f,
+                                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)
+                                )
+
+                                // Y Label
+                                drawText(
+                                    textMeasurer = textMeasurer,
+                                    text = "$${v.toInt()}",
+                                    topLeft = Offset(5f, y - 15f),
+                                    style = androidx.compose.ui.text.TextStyle(fontSize = 10.sp, color = Color.Gray)
+                                )
+                            }
+
+                            // X axis month step
+                            val xStep = plotWidth / 11f
+
+                            // Draw X-axis labels
+                            monthNames.forEachIndexed { i, name ->
+                                val x = startX + i * xStep
+                                drawText(
+                                    textMeasurer = textMeasurer,
+                                    text = name,
+                                    topLeft = Offset(x - 20f, startY + 8f),
+                                    style = androidx.compose.ui.text.TextStyle(fontSize = 10.sp, color = Color.Gray)
+                                )
+                            }
+
+                            // 2. Draw vertical selector line at selectedMonthIndex
+                            val selectedX = startX + selectedMonthIndex * xStep
+                            drawLine(
+                                color = NeonIndigo.copy(alpha = 0.3f),
+                                start = Offset(selectedX, endY),
+                                end = Offset(selectedX, startY),
+                                strokeWidth = 3f,
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(15f, 10f), 0f)
+                            )
+
+                            // 3. Draw 2025 Line
+                            for (i in 0 until 11) {
+                                val x1 = startX + i * xStep
+                                val y1 = startY - ((savings2025[i] - yMin) / yRange).toFloat() * plotHeight
+
+                                val x2 = startX + (i + 1) * xStep
+                                val y2 = startY - ((savings2025[i + 1] - yMin) / yRange).toFloat() * plotHeight
+
+                                drawLine(
+                                    color = SunsetCoral,
+                                    start = Offset(x1, y1),
+                                    end = Offset(x2, y2),
+                                    strokeWidth = 6f
+                                )
+                            }
+
+                            // 4. Draw 2026 Line
+                            for (i in 0 until 11) {
+                                val x1 = startX + i * xStep
+                                val y1 = startY - ((savings2026[i] - yMin) / yRange).toFloat() * plotHeight
+
+                                val x2 = startX + (i + 1) * xStep
+                                val y2 = startY - ((savings2026[i + 1] - yMin) / yRange).toFloat() * plotHeight
+
+                                drawLine(
+                                    color = NeonIndigo,
+                                    start = Offset(x1, y1),
+                                    end = Offset(x2, y2),
+                                    strokeWidth = 6f
+                                )
+                            }
+
+                            // 5. Draw circular points and highlight selected point
+                            savings2025.forEachIndexed { i, val2025 ->
+                                val x = startX + i * xStep
+                                val y = startY - ((val2025 - yMin) / yRange).toFloat() * plotHeight
+                                val isSelected = i == selectedMonthIndex
+                                
+                                drawCircle(
+                                    color = SunsetCoral,
+                                    radius = if (isSelected) 14f else 8f,
+                                    center = Offset(x, y)
+                                )
+                                drawCircle(
+                                    color = if (darkModeEnabled) SophisticatedDarkSurface else Color.White,
+                                    radius = if (isSelected) 6f else 4f,
+                                    center = Offset(x, y)
+                                )
+                            }
+
+                            savings2026.forEachIndexed { i, val2026 ->
+                                val x = startX + i * xStep
+                                val y = startY - ((val2026 - yMin) / yRange).toFloat() * plotHeight
+                                val isSelected = i == selectedMonthIndex
+                                
+                                drawCircle(
+                                    color = NeonIndigo,
+                                    radius = if (isSelected) 14f else 8f,
+                                    center = Offset(x, y)
+                                )
+                                drawCircle(
+                                    color = if (darkModeEnabled) SophisticatedDarkSurface else Color.White,
+                                    radius = if (isSelected) 6f else 4f,
+                                    center = Offset(x, y)
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Tooltip Detail Container
+                    val monthName = fullMonthNames[selectedMonthIndex]
+                    val s25 = savings2025[selectedMonthIndex]
+                    val s26 = savings2026[selectedMonthIndex]
+                    val sp25 = spending2025[selectedMonthIndex]
+                    val sp26 = spending2026[selectedMonthIndex]
+                    val inc25 = s25 + sp25
+                    val inc26 = s26 + sp26
+
+                    val diffSavings = s26 - s25
+                    val diffSavingsPct = if (s25 > 0.0) (diffSavings / s25) * 100.0 else 0.0
+
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(
+                                color = if (darkModeEnabled) Color(0xFF161A26) else Color(0xFFF3F4F6),
+                                shape = RoundedCornerShape(12.dp)
+                            )
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "$monthName Audit Focus",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = if (darkModeEnabled) Color.White else Color.Black
+                            )
+                            
+                            // YoY Savings growth badge
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                modifier = Modifier
+                                    .background(
+                                        color = if (diffSavings >= 0.0) MintEmerald.copy(alpha = 0.15f) else AlertRed.copy(alpha = 0.15f),
+                                        shape = RoundedCornerShape(6.dp)
+                                    )
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (diffSavings >= 0.0) Icons.Default.TrendingUp else Icons.Default.TrendingDown,
+                                    contentDescription = null,
+                                    tint = if (diffSavings >= 0.0) MintEmerald else AlertRed,
+                                    modifier = Modifier.size(12.dp)
+                                )
+                                Text(
+                                    text = "${if (diffSavings >= 0.0) "+" else ""}${String.format("%.1f", diffSavingsPct)}% YoY",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (diffSavings >= 0.0) MintEmerald else AlertRed
+                                )
+                            }
+                        }
+
+                        // Detailed side-by-side values
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            // 2026 Info
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("2026 DETAILS (NEW)", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = NeonIndigo)
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Text("Income", fontSize = 11.sp, color = Color.Gray)
+                                    Text("$${String.format("%,.0f", inc26)}", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = if (darkModeEnabled) Color.White else Color.Black)
+                                }
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Text("Spend", fontSize = 11.sp, color = Color.Gray)
+                                    Text("$${String.format("%,.0f", sp26)}", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = if (darkModeEnabled) Color.White else Color.Black)
+                                }
+                                Divider(modifier = Modifier.padding(vertical = 4.dp), color = Color.Gray.copy(alpha = 0.2f))
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Text("Savings", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = if (darkModeEnabled) Color.White else Color.Black)
+                                    Text("$${String.format("%,.0f", s26)}", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = NeonIndigo)
+                                }
+                            }
+
+                            // 2025 Info
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("2025 DETAILS (PRIOR)", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = SunsetCoral)
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Text("Income", fontSize = 11.sp, color = Color.Gray)
+                                    Text("$${String.format("%,.0f", inc25)}", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = if (darkModeEnabled) Color.White else Color.Black)
+                                }
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Text("Spend", fontSize = 11.sp, color = Color.Gray)
+                                    Text("$${String.format("%,.0f", sp25)}", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = if (darkModeEnabled) Color.White else Color.Black)
+                                }
+                                Divider(modifier = Modifier.padding(vertical = 4.dp), color = Color.Gray.copy(alpha = 0.2f))
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Text("Savings", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = if (darkModeEnabled) Color.White else Color.Black)
+                                    Text("$${String.format("%,.0f", s25)}", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = SunsetCoral)
+                                }
+                            }
+                        }
                     }
                 }
+            }
+        }
 
-                // Generate HTML Button
-                Button(
-                    onClick = {
-                        val html = viewModel.generateHtmlReport()
-                        clipboardManager.setText(AnnotatedString(html))
-                        Toast.makeText(context, "Beautiful HTML Report copied to clipboard!", Toast.LENGTH_LONG).show()
-                        previewType = "HTML"
-                        showExportPreview = true
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = MintEmerald),
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.weight(1f)
-                ) {
+        // More Details Table
+        item {
+            Card(
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (darkModeEnabled) SophisticatedDarkSurface else Color.White
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(
+                        1.dp,
+                        if (darkModeEnabled) SophisticatedBorder.copy(alpha = 0.3f) else Color.LightGray.copy(alpha = 0.4f),
+                        RoundedCornerShape(20.dp)
+                    )
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Year-over-Year Monthly Metrics Breakdown",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = NeonIndigo,
+                        modifier = Modifier.padding(bottom = 12.dp)
+                    )
+
+                    // Table Header
                     Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Icon(Icons.Default.Share, "Share", modifier = Modifier.size(16.dp))
-                        Text("Export HTML Report", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                        Text("Month", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.Gray, modifier = Modifier.width(70.dp))
+                        Text("2025 Savings", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.Gray, modifier = Modifier.weight(1f), textAlign = TextAlign.End)
+                        Text("2026 Savings", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.Gray, modifier = Modifier.weight(1f), textAlign = TextAlign.End)
+                        Text("Growth", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.Gray, modifier = Modifier.weight(1f), textAlign = TextAlign.End)
+                    }
+
+                    Divider(color = Color.Gray.copy(alpha = 0.2f), modifier = Modifier.padding(bottom = 8.dp))
+
+                    fullMonthNames.forEachIndexed { idx, name ->
+                        val s25 = savings2025[idx]
+                        val s26 = savings2026[idx]
+                        val diff = s26 - s25
+                        val pct = if (s25 > 0) (diff / s25) * 100 else 0.0
+
+                        val isMonthSelected = idx == selectedMonthIndex
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { selectedMonthIndex = idx }
+                                .background(
+                                    color = if (isMonthSelected) NeonIndigo.copy(alpha = 0.08f) else Color.Transparent,
+                                    shape = RoundedCornerShape(8.dp)
+                                )
+                                .padding(vertical = 8.dp, horizontal = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = name,
+                                fontSize = 11.sp,
+                                fontWeight = if (isMonthSelected) FontWeight.Bold else FontWeight.Normal,
+                                color = if (isMonthSelected) NeonIndigo else (if (darkModeEnabled) Color.White else Color.Black),
+                                modifier = Modifier.width(70.dp)
+                            )
+                            Text(
+                                text = "$${String.format("%,.0f", s25)}",
+                                fontSize = 11.sp,
+                                color = if (darkModeEnabled) Color.LightGray else Color.DarkGray,
+                                modifier = Modifier.weight(1f),
+                                textAlign = TextAlign.End
+                            )
+                            Text(
+                                text = "$${String.format("%,.0f", s26)}",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isMonthSelected) NeonIndigo else (if (darkModeEnabled) Color.White else Color.Black),
+                                modifier = Modifier.weight(1f),
+                                textAlign = TextAlign.End
+                            )
+                            
+                            // Growth Column with dynamic coloring
+                            Row(
+                                modifier = Modifier.weight(1f),
+                                horizontalArrangement = Arrangement.End,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = if (diff >= 0) Icons.Default.ArrowDropUp else Icons.Default.ArrowDropDown,
+                                    contentDescription = null,
+                                    tint = if (diff >= 0) MintEmerald else AlertRed,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text(
+                                    text = "${String.format("%.0f", if (pct >= 0.0) pct else -pct)}%",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (diff >= 0) MintEmerald else AlertRed
+                                )
+                            }
+                        }
+                        if (idx < 11) {
+                            Divider(color = Color.Gray.copy(alpha = 0.05f))
+                        }
                     }
                 }
             }
         }
 
         item { Spacer(modifier = Modifier.height(24.dp)) }
-    }
-
-    // Export Report Preview popup dialog
-    if (showExportPreview) {
-        Dialog(onDismissRequest = { showExportPreview = false }) {
-            Card(
-                shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.cardColors(containerColor = SophisticatedDarkSurface),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(12.dp)
-                    .border(1.dp, SophisticatedBorder.copy(alpha = 0.3f), RoundedCornerShape(24.dp))
-            ) {
-                Column(
-                    modifier = Modifier.padding(20.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Text(
-                        text = if (previewType == "CSV") "Structured CSV Table" else "Sophisticated HTML Report",
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = if (previewType == "CSV") NeonIndigo else MintEmerald
-                    )
-
-                    val previewStr = if (previewType == "CSV") viewModel.generateCsvReport() else viewModel.generateHtmlReport()
-
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(240.dp)
-                            .background(Color.Black.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
-                            .padding(12.dp)
-                    ) {
-                        LazyColumn {
-                            item {
-                                Text(
-                                    text = previewStr,
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 10.sp,
-                                    color = Color.White.copy(alpha = 0.8f)
-                                )
-                            }
-                        }
-                    }
-
-                    Text(
-                        text = if (previewType == "CSV") {
-                            "The table is formatted in a compliant, beautifully structured CSV with summary metadata and copied to clipboard."
-                        } else {
-                            "The HTML report is fully responsive, featuring custom dark themes, CSS layout, and is ready for browser auditing."
-                        },
-                        fontSize = 11.sp,
-                        color = Color.Gray
-                    )
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        // Native Android Share Intent Trigger
-                        Button(
-                            onClick = {
-                                try {
-                                    val sendIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
-                                        type = if (previewType == "CSV") "text/csv" else "text/html"
-                                        putExtra(android.content.Intent.EXTRA_SUBJECT, if (previewType == "CSV") "Financial_Audit_Report.csv" else "Financial_Audit_Report.html")
-                                        putExtra(android.content.Intent.EXTRA_TEXT, previewStr)
-                                    }
-                                    val shareIntent = android.content.Intent.createChooser(sendIntent, "Export Report")
-                                    context.startActivity(shareIntent)
-                                } catch (e: Exception) {
-                                    Toast.makeText(context, "Share failed: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
-                                }
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color.Gray.copy(alpha = 0.2f), contentColor = Color.White),
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("Share File", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        }
-
-                        Button(
-                            onClick = { showExportPreview = false },
-                            colors = ButtonDefaults.buttonColors(containerColor = if (previewType == "CSV") NeonIndigo else MintEmerald),
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("Done", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -6693,8 +8235,10 @@ fun HomeWidgetInstallationCard(darkModeEnabled: Boolean) {
     var pinSupported by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
-        val appWidgetManager = context.getSystemService(AppWidgetManager::class.java)
-        pinSupported = appWidgetManager?.isRequestPinAppWidgetSupported == true
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            val appWidgetManager = context.getSystemService(AppWidgetManager::class.java)
+            pinSupported = appWidgetManager?.isRequestPinAppWidgetSupported == true
+        }
     }
 
     if (pinSupported) {
@@ -6750,19 +8294,23 @@ fun HomeWidgetInstallationCard(darkModeEnabled: Boolean) {
                 Button(
                     onClick = {
                         try {
-                            val appWidgetManager = context.getSystemService(AppWidgetManager::class.java)
-                            val myProvider = ComponentName(context, ExpenseWidgetProvider::class.java)
-                            if (appWidgetManager != null && appWidgetManager.isRequestPinAppWidgetSupported) {
-                                val pinnedWidgetCallbackIntent = Intent(context, ExpenseWidgetProvider::class.java)
-                                val successCallback = PendingIntent.getBroadcast(
-                                    context,
-                                    0,
-                                    pinnedWidgetCallbackIntent,
-                                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                                )
-                                appWidgetManager.requestPinAppWidget(myProvider, null, successCallback)
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                                val appWidgetManager = context.getSystemService(AppWidgetManager::class.java)
+                                val myProvider = ComponentName(context, ExpenseWidgetProvider::class.java)
+                                if (appWidgetManager != null && appWidgetManager.isRequestPinAppWidgetSupported) {
+                                    val pinnedWidgetCallbackIntent = Intent(context, ExpenseWidgetProvider::class.java)
+                                    val successCallback = PendingIntent.getBroadcast(
+                                        context,
+                                        0,
+                                        pinnedWidgetCallbackIntent,
+                                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                                    )
+                                    appWidgetManager.requestPinAppWidget(myProvider, null, successCallback)
+                                } else {
+                                    Toast.makeText(context, "Direct pinning not supported on this launcher.", Toast.LENGTH_LONG).show()
+                                }
                             } else {
-                                Toast.makeText(context, "Direct pinning not supported on this launcher.", Toast.LENGTH_LONG).show()
+                                Toast.makeText(context, "Desktop widgets pinning requires Android 8.0 Oreo or higher.", Toast.LENGTH_LONG).show()
                             }
                         } catch (e: Exception) {
                             Toast.makeText(context, "Error: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
@@ -6914,6 +8462,100 @@ fun AdvancedPartnerSharingRatioTool(viewModel: MainViewModel) {
                     ),
                     modifier = Modifier.weight(1f).testTag("partner_income_input")
                 )
+            }
+
+            // --- RECOMMENDED SPLIT PERCENTAGE CARD ---
+            val ownPercentage = if (totalIncome > 0) (ownIncome / totalIncome) * 100.0 else 50.0
+            val partnerPercentage = if (totalIncome > 0) (partnerIncome / totalIncome) * 100.0 else 50.0
+
+            Card(
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (darkModeEnabled) Color(0xFF1E2436) else Color(0xFFF3F4F6)
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(
+                        1.dp,
+                        NeonIndigo.copy(alpha = 0.3f),
+                        RoundedCornerShape(12.dp)
+                    )
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = "RECOMMENDED INCOME SHARING SPLIT Ratios",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = NeonIndigo,
+                        letterSpacing = 1.sp
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(horizontalAlignment = Alignment.Start) {
+                            Text("Your Share", fontSize = 11.sp, color = Color.Gray)
+                            Text(
+                                text = "${String.format("%.1f", ownPercentage)}%",
+                                fontSize = 20.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = NeonIndigo
+                            )
+                        }
+
+                        Icon(
+                            imageVector = Icons.Default.Sync,
+                            contentDescription = "Split Ratio",
+                            tint = Color.Gray,
+                            modifier = Modifier.size(20.dp)
+                        )
+
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("Partner's Share", fontSize = 11.sp, color = Color.Gray)
+                            Text(
+                                text = "${String.format("%.1f", partnerPercentage)}%",
+                                fontSize = 20.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = SunsetCoral
+                            )
+                        }
+                    }
+
+                    // Progress bar representing the split visually
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(8.dp)
+                            .clip(CircleShape)
+                    ) {
+                        val oWeight = if (ownPercentage > 0) ownPercentage.toFloat() else 50f
+                        val pWeight = if (partnerPercentage > 0) partnerPercentage.toFloat() else 50f
+                        Box(
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .weight(oWeight)
+                                .background(NeonIndigo)
+                        )
+                        Box(
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .weight(pWeight)
+                                .background(SunsetCoral)
+                        )
+                    }
+
+                    Text(
+                        text = "Based on combined income: $${String.format("%,.2f", totalIncome)}",
+                        fontSize = 9.sp,
+                        color = Color.Gray
+                    )
+                }
             }
 
             // Split Strategy Title
@@ -7265,7 +8907,152 @@ fun ProfileSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                                     .background(MintEmerald.copy(alpha = 0.15f), RoundedCornerShape(6.dp))
                                     .padding(horizontal = 6.dp, vertical = 2.dp)
                             ) {
-                                Text("SECURELY RECORDED", fontSize = 8.sp, fontWeight = FontWeight.Black, color = MintEmerald)
+                               Text("SECURELY RECORDED", fontSize = 8.sp, fontWeight = FontWeight.Black, color = MintEmerald)
+                            }
+                        }
+                    }
+                }
+
+                // Security & Biometric Settings
+                item {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(
+                                if (darkModeEnabled) Color(0xFF161A26) else Color(0xFFF3F4F6),
+                                RoundedCornerShape(16.dp)
+                            )
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            text = "SECURITY & BIOMETRICS (STORED IN DB)",
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = NeonIndigo,
+                            letterSpacing = 1.sp
+                        )
+
+                        val familyConfig by viewModel.familyConfig.collectAsState()
+                        val passkeyRegistered = familyConfig?.passkeyRegistered ?: false
+                        val fingerAuthRegistered = familyConfig?.fingerAuthRegistered ?: false
+                        val storedPasscode = familyConfig?.storedPasscode ?: "1234"
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Icon(Icons.Default.VpnKey, "Passkey", tint = MintEmerald, modifier = Modifier.size(16.dp))
+                                Column {
+                                    Text("Register Passkey Auth", fontSize = 12.sp, color = if (darkModeEnabled) Color.White else Color.Black)
+                                    Text("Secure passkey stored in DB", fontSize = 10.sp, color = Color.Gray)
+                                }
+                            }
+                            Switch(
+                                checked = passkeyRegistered,
+                                onCheckedChange = { viewModel.registerCredentials(it, fingerAuthRegistered) },
+                                colors = SwitchDefaults.colors(checkedThumbColor = MintEmerald, checkedTrackColor = MintEmerald.copy(alpha = 0.4f))
+                            )
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Icon(Icons.Default.Fingerprint, "Finger", tint = MintEmerald, modifier = Modifier.size(16.dp))
+                                Column {
+                                    Text("Register Fingerprint Auth", fontSize = 12.sp, color = if (darkModeEnabled) Color.White else Color.Black)
+                                    Text("Stored biometric metadata", fontSize = 10.sp, color = Color.Gray)
+                                }
+                            }
+                            Switch(
+                                checked = fingerAuthRegistered,
+                                onCheckedChange = { viewModel.registerCredentials(passkeyRegistered, it) },
+                                colors = SwitchDefaults.colors(checkedThumbColor = MintEmerald, checkedTrackColor = MintEmerald.copy(alpha = 0.4f))
+                            )
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Icon(Icons.Default.Lock, "Passcode", tint = NeonIndigo, modifier = Modifier.size(16.dp))
+                                Column {
+                                    Text("Active Account PIN Code", fontSize = 12.sp, color = if (darkModeEnabled) Color.White else Color.Black)
+                                    Text("Passcode: $storedPasscode", fontSize = 10.sp, color = Color.Gray)
+                                }
+                            }
+                            
+                            var showPasscodeDialog by remember { mutableStateOf(false) }
+                            var newPINInput by remember { mutableStateOf("") }
+                            
+                            Button(
+                                onClick = { showPasscodeDialog = true },
+                                colors = ButtonDefaults.buttonColors(containerColor = NeonIndigo.copy(alpha = 0.2f)),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                modifier = Modifier.height(32.dp)
+                            ) {
+                                Text("Change PIN", fontSize = 11.sp, color = NeonIndigo, fontWeight = FontWeight.Bold)
+                            }
+                            
+                            if (showPasscodeDialog) {
+                                var validationError by remember { mutableStateOf<String?>(null) }
+                                AlertDialog(
+                                    onDismissRequest = { showPasscodeDialog = false },
+                                    title = { Text("Update Security PIN") },
+                                    text = {
+                                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            Text("Set a custom numeric passcode/PIN for login. Must be exactly 4 digits:")
+                                            OutlinedTextField(
+                                                value = newPINInput,
+                                                onValueChange = { 
+                                                    if (it.length <= 4 && it.all { c -> c.isDigit() }) {
+                                                        newPINInput = it
+                                                        validationError = null
+                                                    }
+                                                },
+                                                label = { Text("New 4-Digit PIN") },
+                                                placeholder = { Text("e.g. 1234") },
+                                                singleLine = true
+                                            )
+                                            if (validationError != null) {
+                                                Text(
+                                                    text = validationError!!,
+                                                    color = AlertRed,
+                                                    fontSize = 11.sp,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                            }
+                                        }
+                                    },
+                                    confirmButton = {
+                                        Button(
+                                            onClick = {
+                                                if (newPINInput.length == 4) {
+                                                    viewModel.registerPIN(newPINInput)
+                                                    showPasscodeDialog = false
+                                                    newPINInput = ""
+                                                } else {
+                                                    validationError = "PIN must be exactly 4 numeric digits."
+                                                }
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = NeonIndigo)
+                                        ) {
+                                            Text("Save")
+                                        }
+                                    },
+                                    dismissButton = {
+                                        TextButton(onClick = { showPasscodeDialog = false }) {
+                                            Text("Cancel")
+                                        }
+                                    }
+                                )
                             }
                         }
                     }
@@ -7325,7 +9112,7 @@ fun ProfileSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                                     onValueChange = { cardName = it },
                                     label = { Text("Card Brand/Name", fontSize = 11.sp) },
                                     singleLine = true,
-                                    modifier = Modifier.fillMaxWidth().height(48.dp)
+                                    modifier = Modifier.fillMaxWidth().height(56.dp)
                                 )
 
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -7334,14 +9121,14 @@ fun ProfileSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                                         onValueChange = { if (it.length <= 4) cardLast4 = it },
                                         label = { Text("Last 4 digits", fontSize = 11.sp) },
                                         singleLine = true,
-                                        modifier = Modifier.weight(1f).height(48.dp)
+                                        modifier = Modifier.weight(1f).height(56.dp)
                                     )
                                     OutlinedTextField(
                                         value = cardLimit,
                                         onValueChange = { cardLimit = it },
                                         label = { Text("Credit Limit ($)", fontSize = 11.sp) },
                                         singleLine = true,
-                                        modifier = Modifier.weight(1.2f).height(48.dp)
+                                        modifier = Modifier.weight(1.2f).height(56.dp)
                                     )
                                 }
 
@@ -7355,7 +9142,7 @@ fun ProfileSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                                         onValueChange = { dueDate = it },
                                         label = { Text("Payment Due Date", fontSize = 11.sp) },
                                         singleLine = true,
-                                        modifier = Modifier.width(130.dp).height(48.dp)
+                                        modifier = Modifier.width(130.dp).height(56.dp)
                                     )
                                     
                                     Button(
@@ -7441,6 +9228,195 @@ fun ProfileSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                                     tint = AlertRed.copy(alpha = 0.8f),
                                     modifier = Modifier.size(16.dp)
                                 )
+                            }
+                        }
+                    }
+                }
+
+                // Daily Record Reminder Settings
+                item {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(
+                                if (darkModeEnabled) Color(0xFF161A26) else Color(0xFFF3F4F6),
+                                RoundedCornerShape(16.dp)
+                            )
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            text = "DAILY RECORD REMINDER SETTINGS",
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = NeonIndigo,
+                            letterSpacing = 1.sp
+                        )
+
+                        val context = LocalContext.current
+                        val familyConfig by viewModel.familyConfig.collectAsState()
+                        val dailyAlertEnabled = familyConfig?.dailyAlertEnabled ?: false
+                        val dailyAlertTime = familyConfig?.dailyAlertTime ?: "20:00"
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Icon(
+                                    imageVector = Icons.Default.Notifications,
+                                    contentDescription = "Alerts",
+                                    tint = NeonIndigo,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Column {
+                                    Text("Enable Daily Alerts", fontSize = 12.sp, color = if (darkModeEnabled) Color.White else Color.Black)
+                                    Text("Sends a friendly reminder to itemize logs", fontSize = 10.sp, color = Color.Gray)
+                                }
+                            }
+                            Switch(
+                                checked = dailyAlertEnabled,
+                                onCheckedChange = { viewModel.updateDailyAlertSettings(context, it, dailyAlertTime) },
+                                colors = SwitchDefaults.colors(checkedThumbColor = NeonIndigo, checkedTrackColor = NeonIndigo.copy(alpha = 0.4f)),
+                                modifier = Modifier.testTag("daily_alert_switch")
+                            )
+                        }
+
+                        if (dailyAlertEnabled) {
+                            Divider(color = if (darkModeEnabled) Color.Gray.copy(alpha = 0.2f) else Color.LightGray.copy(alpha = 0.3f))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Icon(
+                                        imageVector = Icons.Default.Schedule,
+                                        contentDescription = "Time",
+                                        tint = MintEmerald,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Column {
+                                        Text("Reminder Time", fontSize = 12.sp, color = if (darkModeEnabled) Color.White else Color.Black)
+                                        Text("Current: $dailyAlertTime", fontSize = 10.sp, color = Color.Gray)
+                                    }
+                                }
+
+                                var showTimePicker by remember { mutableStateOf(false) }
+                                Button(
+                                    onClick = { showTimePicker = true },
+                                    colors = ButtonDefaults.buttonColors(containerColor = MintEmerald.copy(alpha = 0.15f)),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(32.dp).testTag("select_time_button")
+                                ) {
+                                    Text("Change Time", fontSize = 11.sp, color = MintEmerald, fontWeight = FontWeight.Bold)
+                                }
+
+                                if (showTimePicker) {
+                                    var customHour by remember { mutableStateOf(dailyAlertTime.split(":").getOrNull(0) ?: "20") }
+                                    var customMinute by remember { mutableStateOf(dailyAlertTime.split(":").getOrNull(1) ?: "00") }
+
+                                    AlertDialog(
+                                        onDismissRequest = { showTimePicker = false },
+                                        title = { Text("Set Reminder Time", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = if (darkModeEnabled) Color.White else Color.Black) },
+                                        text = {
+                                            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                                Text("Enter time in 24-hour format (HH:MM):", fontSize = 12.sp, color = Color.Gray)
+                                                Row(
+                                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    OutlinedTextField(
+                                                        value = customHour,
+                                                        onValueChange = { if (it.length <= 2) customHour = it.filter { char -> char.isDigit() } },
+                                                        label = { Text("Hour") },
+                                                        modifier = Modifier.weight(1f).testTag("reminder_hour_input"),
+                                                        singleLine = true,
+                                                        colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = MintEmerald)
+                                                    )
+                                                    Text(":", fontWeight = FontWeight.Bold, fontSize = 20.sp, color = if (darkModeEnabled) Color.White else Color.Black)
+                                                    OutlinedTextField(
+                                                        value = customMinute,
+                                                        onValueChange = { if (it.length <= 2) customMinute = it.filter { char -> char.isDigit() } },
+                                                        label = { Text("Minute") },
+                                                        modifier = Modifier.weight(1f).testTag("reminder_minute_input"),
+                                                        singleLine = true,
+                                                        colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = MintEmerald)
+                                                    )
+                                                }
+                                            }
+                                        },
+                                        confirmButton = {
+                                            TextButton(
+                                                onClick = {
+                                                    val hrInt = customHour.toIntOrNull() ?: 20
+                                                    val minInt = customMinute.toIntOrNull() ?: 0
+                                                    val formattedHour = String.format("%02d", hrInt.coerceIn(0, 23))
+                                                    val formattedMinute = String.format("%02d", minInt.coerceIn(0, 59))
+                                                    viewModel.updateDailyAlertSettings(context, true, "$formattedHour:$formattedMinute")
+                                                    showTimePicker = false
+                                                }
+                                            ) {
+                                                Text("Save", color = MintEmerald, fontWeight = FontWeight.Bold)
+                                            }
+                                        },
+                                        dismissButton = {
+                                            TextButton(onClick = { showTimePicker = false }) {
+                                                Text("Cancel", color = Color.Gray)
+                                            }
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Data Management (Erase Sample Data & Traces)
+                item {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(
+                                if (darkModeEnabled) Color(0xFF161A26) else Color(0xFFF3F4F6),
+                                RoundedCornerShape(16.dp)
+                            )
+                            .border(
+                                1.dp,
+                                AlertRed.copy(alpha = 0.3f),
+                                RoundedCornerShape(16.dp)
+                            )
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Text(
+                            text = "DATA MANAGEMENT (DANGER ZONE)",
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = AlertRed,
+                            letterSpacing = 1.sp
+                        )
+                        Text(
+                            text = "This will erase all of your sample tracking data, transactions, credit cards, bank loans, and recurring plans. This action cannot be undone.",
+                            fontSize = 11.sp,
+                            color = Color.Gray
+                        )
+                        Button(
+                            onClick = {
+                                viewModel.clearAllSampleData()
+                                onDismiss()
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = AlertRed),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth().testTag("clear_data_button")
+                        ) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Default.Delete, contentDescription = "Erase", tint = Color.White)
+                                Text("Erase All Sample Data & Traces", fontWeight = FontWeight.Bold, color = Color.White, fontSize = 12.sp)
                             }
                         }
                     }

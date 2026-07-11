@@ -102,22 +102,61 @@ object GeminiScannerService {
             return@withContext ParsedReceipt(
                 merchant = "Mock Cafe & Bistro",
                 amount = 42.50,
-                category = "Food & Grocery",
+                category = "Dine Out & Café",
                 date = "2026-07-09",
                 isMock = true,
-                errorMessage = "API key not configured in Secrets panel. Using simulated OCR scanner."
+                errorMessage = "API key not configured in Secrets panel. Using simulated OCR scanner.",
+                items = listOf(
+                    ParsedReceiptItem("Organic Avocados & Bananas", 12.50, "Food & Grocery"),
+                    ParsedReceiptItem("Premium Coffee Roast", 8.50, "Dine Out & Café"),
+                    ParsedReceiptItem("Cinema Ticket Deluxe", 14.51, "Entertainment & Gaming"),
+                    ParsedReceiptItem("Monthly Streaming Pass", 6.99, "Bill & Subscription")
+                )
             )
         }
 
         val base64Image = bitmap.toBase64()
         val prompt = """
-            You are an expert financial receipt scanner. Please analyze this receipt image.
-            Extract the following details as a valid JSON object. Do not include any markdown backticks or formatting like ```json. Return ONLY the JSON object.
-            Fields:
-            - merchant (string): The merchant, cafe, store, or company name.
-            - amount (number): The total amount charged (as a decimal double).
-            - category (string): Must be one of: 'Food & Grocery', 'Investment', 'Shopping', 'Travelling', 'Bill & Subscription', 'Miscellaneous'.
-            - date (string): Format YYYY-MM-DD. If not clear, default to today's date.
+            You are an advanced AI financial receipt parser. Your goal is to inspect the receipt image with pixel-perfect accuracy and extract structured financial data.
+            
+            Extract these high-level fields:
+            1. 'merchant': The company, brand, cafe, store, or company name. Keep it concise and clean.
+            2. 'amount': The absolute grand total amount paid, as a positive decimal number (double).
+            3. 'category': The overall main category for the entire receipt based on the highest expenditure.
+            4. 'date': The purchase date in 'YYYY-MM-DD' format. If missing or illegible, default to today's date.
+            
+            Extract all individual items from the receipt. For each item, capture:
+            - 'name': Clear, readable name of the product or service (expand abbreviations where obvious, e.g., 'BND' -> 'Binder', 'CHKN' -> 'Chicken').
+            - 'price': The exact line item price.
+            - 'category': The item's individual category from the following allowed set:
+              * 'Food & Grocery': Supermarkets, food ingredients, whole foods.
+              * 'Dine Out & Café': Restaurants, cafes, fast food, coffee shops, bars.
+              * 'Shopping': Clothing, electronics, hardware, general retail, online shopping.
+              * 'Travelling': Flights, public transit, Uber/Lyft, gas stations, parking, car rental.
+              * 'Bill & Subscription': Streaming platforms, phone bills, insurance, recurring charges.
+              * 'Health & Medical': Pharmacy, clinics, dentist, fitness subscriptions, vitamins.
+              * 'Entertainment & Gaming': Cinema, video games, concerts, hobbies.
+              * 'Education & Self-Care': Books, courses, hair salon, spa, mental health.
+              * 'Utilities & Rent': Electricity, water, rent, internet.
+              * 'Investment': Stock purchases, bond investments, gold, mutual funds.
+              * 'Miscellaneous': Any item that cannot fit into the above.
+              
+            CRITICAL BALANCING RULES:
+            - Ensure the sum of item prices matches the total 'amount' of the receipt exactly.
+            - If there is a Tax, Tip, or Service Fee on the receipt, represent it as its own item (e.g., name: "Sales Tax" or "Tips") and categorize it as 'Miscellaneous' so the line items add up perfectly to the grand total.
+            - If there is a discount applied to the entire receipt, distribute it proportionally among the items or add a negative price item like name: "Discount Applied" to keep the sum mathematically perfect!
+            
+            Return the output ONLY as a single valid JSON object. Do not wrap it in markdown backticks or any other text.
+            JSON Schema:
+            {
+              "merchant": "string",
+              "amount": double,
+              "category": "string",
+              "date": "string",
+              "items": [
+                { "name": "string", "price": double, "category": "string" }
+              ]
+            }
         """.trimIndent()
 
         // Build Gemini direct REST payload manually to keep imports slim and reliable
@@ -167,7 +206,12 @@ object GeminiScannerService {
                     category = "Shopping",
                     date = "2026-07-09",
                     isMock = true,
-                    errorMessage = "Server error ${response.code}: ${response.message}. Using offline preview."
+                    errorMessage = "Server error ${response.code}: ${response.message}. Using offline preview.",
+                    items = listOf(
+                        ParsedReceiptItem("Tide Laundry Detergent", 19.99, "Shopping"),
+                        ParsedReceiptItem("Wireless Earbuds Pro", 45.00, "Entertainment & Gaming"),
+                        ParsedReceiptItem("Fresh Blueberries Basket", 25.00, "Food & Grocery")
+                    )
                 )
             }
 
@@ -185,22 +229,44 @@ object GeminiScannerService {
             val cleanedText = textResponse.trim().removeSurrounding("```json", "```").trim()
             val parsedJson = JSONObject(cleanedText)
 
+            val itemsList = ArrayList<ParsedReceiptItem>()
+            val jsonItems = parsedJson.optJSONArray("items")
+            if (jsonItems != null) {
+                for (i in 0 until jsonItems.length()) {
+                    val itemObj = jsonItems.getJSONObject(i)
+                    itemsList.add(
+                        ParsedReceiptItem(
+                            name = itemObj.optString("name", "Unknown Item"),
+                            price = itemObj.optDouble("price", 0.0),
+                            category = itemObj.optString("category", "Miscellaneous")
+                        )
+                    )
+                }
+            }
+
             ParsedReceipt(
                 merchant = parsedJson.optString("merchant", "Unknown Merchant"),
                 amount = parsedJson.optDouble("amount", 0.0),
                 category = parsedJson.optString("category", "Miscellaneous"),
                 date = parsedJson.optString("date", "2026-07-09"),
-                isMock = false
+                isMock = false,
+                items = itemsList
             )
         } catch (e: Exception) {
             Log.e(TAG, "Error scanning receipt: ${e.message}", e)
             ParsedReceipt(
                 merchant = "Mock Cafe & Bistro",
                 amount = 42.50,
-                category = "Food & Grocery",
+                category = "Dine Out & Café",
                 date = "2026-07-09",
                 isMock = true,
-                errorMessage = "Offline or scan error: ${e.localizedMessage}. Loaded in-memory preview."
+                errorMessage = "Offline or scan error: ${e.localizedMessage}. Loaded in-memory preview.",
+                items = listOf(
+                    ParsedReceiptItem("Organic Avocados & Bananas", 12.50, "Food & Grocery"),
+                    ParsedReceiptItem("Premium Coffee Roast", 8.50, "Dine Out & Café"),
+                    ParsedReceiptItem("Cinema Ticket Deluxe", 14.51, "Entertainment & Gaming"),
+                    ParsedReceiptItem("Monthly Streaming Pass", 6.99, "Bill & Subscription")
+                )
             )
         }
     }
@@ -267,8 +333,21 @@ object GeminiScannerService {
 
             val prompt = if (textContent != null) {
                 """
-                    You are an expert financial auditor and data extractor. Please analyze the following text or CSV data containing financial records.
-                    Extract all individual transactions (expenses, income, investments) and return them as a valid JSON object. Do not include markdown formatting or backticks.
+                    You are an advanced AI financial auditor and transaction extractor. Analyze the following text or CSV transaction list with high precision.
+                    Extract all individual transaction items (expenses, income, investments) and return them as a valid JSON object.
+                    
+                    Allowed Categories:
+                    - 'Food & Grocery'
+                    - 'Dine Out & Café'
+                    - 'Shopping'
+                    - 'Travelling'
+                    - 'Bill & Subscription'
+                    - 'Health & Medical'
+                    - 'Entertainment & Gaming'
+                    - 'Education & Self-Care'
+                    - 'Utilities & Rent'
+                    - 'Investment'
+                    - 'Miscellaneous'
                     
                     Format of the JSON response:
                     {
@@ -289,8 +368,21 @@ object GeminiScannerService {
                 """.trimIndent()
             } else {
                 """
-                    You are an expert financial auditor. Please analyze this document image page.
-                    Extract all individual financial transaction items (receipt rows, invoice items, billing list, or bank statement records) and return them as a valid JSON object. Do not include markdown formatting or backticks.
+                    You are an advanced AI financial auditor. Please analyze this document image page.
+                    Extract all individual financial transaction items (receipt rows, invoice items, billing list, or bank statement records) and return them as a valid JSON object.
+                    
+                    Allowed Categories:
+                    - 'Food & Grocery'
+                    - 'Dine Out & Café'
+                    - 'Shopping'
+                    - 'Travelling'
+                    - 'Bill & Subscription'
+                    - 'Health & Medical'
+                    - 'Entertainment & Gaming'
+                    - 'Education & Self-Care'
+                    - 'Utilities & Rent'
+                    - 'Investment'
+                    - 'Miscellaneous'
                     
                     Format of the JSON response:
                     {
@@ -393,13 +485,20 @@ object GeminiScannerService {
     }
 }
 
+data class ParsedReceiptItem(
+    val name: String,
+    val price: Double,
+    val category: String
+)
+
 data class ParsedReceipt(
     val merchant: String,
     val amount: Double,
     val category: String,
     val date: String,
     val isMock: Boolean = false,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val items: List<ParsedReceiptItem> = emptyList()
 )
 
 data class ParsedDocumentTransaction(

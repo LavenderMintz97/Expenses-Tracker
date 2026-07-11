@@ -82,9 +82,11 @@ class ExpenseRepository(private val dao: ExpenseDao) {
     suspend fun prepopulateIfEmpty() {
         // Prepopulate configuration if empty
         val existingConfig = dao.getFamilyConfig()
-        if (existingConfig == null) {
-            dao.insertFamilyConfig(FamilyConfigEntity())
+        if (existingConfig != null) {
+            // Already initialized previously, do not prepopulate again (respect manual clear/delete operations)
+            return
         }
+        dao.insertFamilyConfig(FamilyConfigEntity())
 
         // Prepopulate transactions if empty
         val currentTransactions = dao.getAllTransactions().firstOrNull()
@@ -246,5 +248,14 @@ class ExpenseRepository(private val dao: ExpenseDao) {
                 dao.insertRecurringTransaction(rec)
             }
         }
+    }
+
+    suspend fun clearAllData() {
+        dao.deleteAllTransactions()
+        dao.deleteAllGoals()
+        dao.deleteAllCategoryBudgets()
+        dao.deleteAllCreditCards()
+        dao.deleteAllBankLendings()
+        dao.deleteAllRecurringTransactions()
     }
 }

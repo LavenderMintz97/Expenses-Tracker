@@ -22,6 +22,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
 class MainViewModel(private val repository: ExpenseRepository) : ViewModel() {
@@ -75,13 +76,46 @@ class MainViewModel(private val repository: ExpenseRepository) : ViewModel() {
     private val _familySharingCode = MutableStateFlow("EX-8902-SYNC")
     val familySharingCode = _familySharingCode.asStateFlow()
 
+    // Undo stack state
+    private val undoStack = java.util.ArrayList<suspend () -> Unit>()
+    private val _canUndo = MutableStateFlow(false)
+    val canUndo = _canUndo.asStateFlow()
+
+    fun pushUndoAction(message: String, action: suspend () -> Unit) {
+        undoStack.add(action)
+        _canUndo.value = true
+        simulateNotification("$message (Tap Undo to revert)")
+    }
+
+    fun triggerUndo() {
+        viewModelScope.launch {
+            if (undoStack.isNotEmpty()) {
+                val lastAction = undoStack.removeAt(undoStack.size - 1)
+                lastAction()
+                _canUndo.value = undoStack.isNotEmpty()
+                simulateNotification("Action undone successfully!")
+            } else {
+                simulateNotification("Nothing to undo!")
+            }
+        }
+    }
+
     // Database Flows
-    val transactions: StateFlow<List<TransactionEntity>> = repository.allTransactions
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyList()
-        )
+    val transactions: StateFlow<List<TransactionEntity>> = combine(
+        repository.allTransactions,
+        _userName,
+        _userSignedIn
+    ) { all, user, signedIn ->
+        if (signedIn && user.isNotBlank()) {
+            all.filter { it.userName.isNullOrBlank() || it.userName.equals(user, ignoreCase = true) }
+        } else {
+            all
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = emptyList()
+    )
 
     val goals: StateFlow<List<GoalEntity>> = repository.allGoals
         .stateIn(
@@ -138,6 +172,7 @@ class MainViewModel(private val repository: ExpenseRepository) : ViewModel() {
         viewModelScope.launch {
             repository.familyConfigFlow.collect { config ->
                 if (config != null) {
+                    _darkModeEnabled.value = config.darkModeEnabled
                     if (config.currentUserName.isNotBlank() && _userName.value.isBlank()) {
                         _userName.value = config.currentUserName
                     }
@@ -159,25 +194,69 @@ class MainViewModel(private val repository: ExpenseRepository) : ViewModel() {
 
     // Actions
     fun toggleDarkMode() {
-        _darkModeEnabled.value = !_darkModeEnabled.value
+        val nextValue = !_darkModeEnabled.value
+        _darkModeEnabled.value = nextValue
+        viewModelScope.launch {
+            val current = repository.getFamilyConfig() ?: FamilyConfigEntity()
+            repository.saveFamilyConfig(current.copy(darkModeEnabled = nextValue))
+        }
     }
 
     fun signIn(username: String) {
-        if (username.isNotBlank()) {
-            _userName.value = username
-            _userSignedIn.value = true
-            _showBiometricPrompt.value = true // Require biometric entry immediately
-            
-            viewModelScope.launch {
-                val current = repository.getFamilyConfig() ?: FamilyConfigEntity()
+        signInWithCredentials(username, "1234") { _, _ -> }
+    }
+
+    fun signInWithCredentials(username: String, pin: String, onResult: (Boolean, String) -> Unit) {
+        if (username.isBlank()) {
+            onResult(false, "Username cannot be blank")
+            return
+        }
+        viewModelScope.launch {
+            val current = repository.getFamilyConfig() ?: FamilyConfigEntity()
+            if (current.storedPasscode.isNotBlank() && current.storedPasscode != pin) {
+                onResult(false, "Incorrect PIN. Please try again.")
+            } else {
+                _userName.value = username
+                _userSignedIn.value = true
+                _showBiometricPrompt.value = true
+                
                 repository.saveFamilyConfig(
                     current.copy(
                         currentUserName = username,
+                        storedPasscode = pin.ifBlank { "1234" },
                         userSignedIn = true,
-                        biometricsPassed = false
+                        biometricsPassed = false,
+                        passkeyRegistered = true,
+                        fingerAuthRegistered = true
                     )
                 )
+                onResult(true, "Authentication details recorded in database.")
             }
+        }
+    }
+
+    fun registerCredentials(passkey: Boolean, finger: Boolean) {
+        viewModelScope.launch {
+            val current = repository.getFamilyConfig() ?: FamilyConfigEntity()
+            repository.saveFamilyConfig(
+                current.copy(
+                    passkeyRegistered = passkey,
+                    fingerAuthRegistered = finger
+                )
+            )
+            simulateNotification("Passkey & Finger Auth settings updated in local DB.")
+        }
+    }
+
+    fun registerPIN(pin: String) {
+        viewModelScope.launch {
+            val current = repository.getFamilyConfig() ?: FamilyConfigEntity()
+            repository.saveFamilyConfig(
+                current.copy(
+                    storedPasscode = pin
+                )
+            )
+            simulateNotification("Account passcode PIN updated in local DB.")
         }
     }
 
@@ -323,7 +402,16 @@ class MainViewModel(private val repository: ExpenseRepository) : ViewModel() {
     fun deleteTransaction(tx: TransactionEntity) {
         viewModelScope.launch {
             repository.deleteTransaction(tx)
-            simulateNotification("Deleted record: ${tx.title}")
+            pushUndoAction("Deleted record: ${tx.title}") {
+                repository.insertTransaction(tx)
+            }
+        }
+    }
+
+    fun updateTransaction(tx: TransactionEntity) {
+        viewModelScope.launch {
+            repository.insertTransaction(tx)
+            simulateNotification("Updated record: ${tx.title} ($${String.format("%.2f", tx.amount)})")
         }
     }
 
@@ -337,7 +425,9 @@ class MainViewModel(private val repository: ExpenseRepository) : ViewModel() {
     fun deleteCategoryBudget(budget: CategoryBudgetEntity) {
         viewModelScope.launch {
             repository.deleteCategoryBudget(budget)
-            simulateNotification("Deleted budget limit for ${budget.category}")
+            pushUndoAction("Deleted budget limit for ${budget.category}") {
+                repository.insertCategoryBudget(budget)
+            }
         }
     }
 
@@ -351,7 +441,9 @@ class MainViewModel(private val repository: ExpenseRepository) : ViewModel() {
     fun deleteCreditCard(card: CreditCardEntity) {
         viewModelScope.launch {
             repository.deleteCreditCard(card)
-            simulateNotification("Removed credit card: ${card.name}")
+            pushUndoAction("Removed credit card: ${card.name}") {
+                repository.insertCreditCard(card)
+            }
         }
     }
 
@@ -405,7 +497,9 @@ class MainViewModel(private val repository: ExpenseRepository) : ViewModel() {
     fun deleteBankLending(lending: BankLendingEntity) {
         viewModelScope.launch {
             repository.deleteBankLending(lending)
-            simulateNotification("Removed bank lending: ${lending.loanName}")
+            pushUndoAction("Removed bank lending: ${lending.loanName}") {
+                repository.insertBankLending(lending)
+            }
         }
     }
 
@@ -443,7 +537,9 @@ class MainViewModel(private val repository: ExpenseRepository) : ViewModel() {
     fun deleteRecurringTransaction(rec: RecurringTransactionEntity) {
         viewModelScope.launch {
             repository.deleteRecurringTransaction(rec)
-            simulateNotification("Removed recurring transaction: ${rec.title}")
+            pushUndoAction("Removed recurring transaction: ${rec.title}") {
+                repository.insertRecurringTransaction(rec)
+            }
         }
     }
 
@@ -516,7 +612,9 @@ class MainViewModel(private val repository: ExpenseRepository) : ViewModel() {
     fun deleteGoal(goal: GoalEntity) {
         viewModelScope.launch {
             repository.deleteGoal(goal)
-            simulateNotification("Savings goal removed.")
+            pushUndoAction("Savings goal removed: ${goal.title}") {
+                repository.insertGoal(goal)
+            }
         }
     }
 
@@ -542,6 +640,24 @@ class MainViewModel(private val repository: ExpenseRepository) : ViewModel() {
             val updated = current.copy(contributionType = type)
             repository.saveFamilyConfig(updated)
             simulateNotification("Contribution method updated to: ${type.replace("_", " ")}")
+        }
+    }
+
+    fun updateDailyAlertSettings(context: Context, enabled: Boolean, timeString: String) {
+        viewModelScope.launch {
+            val current = repository.getFamilyConfig() ?: FamilyConfigEntity()
+            val updated = current.copy(
+                dailyAlertEnabled = enabled,
+                dailyAlertTime = timeString
+            )
+            repository.saveFamilyConfig(updated)
+            if (enabled) {
+                DailyReminderReceiver.schedule(context, timeString)
+                simulateNotification("Daily recording reminder active for $timeString!")
+            } else {
+                DailyReminderReceiver.cancel(context)
+                simulateNotification("Daily recording reminder disabled")
+            }
         }
     }
 
@@ -625,6 +741,17 @@ class MainViewModel(private val repository: ExpenseRepository) : ViewModel() {
                 _isDocumentScanning.value = false
                 simulateNotification("Scan failed: ${e.localizedMessage}")
                 onResult(com.example.data.ParsedDocumentResult(emptyList(), false, e.localizedMessage))
+            }
+        }
+    }
+
+    fun clearAllSampleData() {
+        viewModelScope.launch {
+            try {
+                repository.clearAllData()
+                simulateNotification("All sample records, cards, loans, budgets & savings goals erased completely.")
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "Error clearing data: ${e.message}")
             }
         }
     }
